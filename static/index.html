@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WARGAMES — Chess AI</title>
+
+  <!-- chessboard.js -->
+  <link rel="stylesheet"
+    href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Courier New', monospace;
+      background: #0a0a0a;
+      color: #e0e0e0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    header {
+      width: 100%;
+      padding: 18px 32px;
+      border-bottom: 1px solid #222;
+      text-align: center;
+    }
+    header h1 {
+      font-size: 1.4rem;
+      letter-spacing: 0.25em;
+      color: #fff;
+    }
+    header p {
+      font-size: 0.75rem;
+      color: #666;
+      margin-top: 4px;
+      letter-spacing: 0.1em;
+    }
+
+    .container {
+      display: flex;
+      gap: 32px;
+      padding: 32px;
+      max-width: 900px;
+      width: 100%;
+      align-items: flex-start;
+    }
+
+    /* ── Board ── */
+    #board { width: 420px; flex-shrink: 0; }
+
+    /* ── Sidebar ── */
+    .sidebar {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      min-width: 220px;
+    }
+
+    .card {
+      background: #111;
+      border: 1px solid #222;
+      border-radius: 6px;
+      padding: 16px;
+    }
+    .card h3 {
+      font-size: 0.7rem;
+      letter-spacing: 0.2em;
+      color: #666;
+      text-transform: uppercase;
+      margin-bottom: 12px;
+    }
+
+    /* Stats grid */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .stat {
+      text-align: center;
+    }
+    .stat .value {
+      font-size: 1.5rem;
+      font-weight: bold;
+      color: #fff;
+    }
+    .stat .label {
+      font-size: 0.65rem;
+      color: #555;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      margin-top: 2px;
+    }
+    #elo-value { color: #4caf50; }
+
+    /* Record */
+    .record {
+      display: flex;
+      justify-content: space-around;
+      text-align: center;
+    }
+    .record .val { font-size: 1.2rem; font-weight: bold; }
+    .record .lbl { font-size: 0.6rem; color: #555; text-transform: uppercase; }
+    .win-val   { color: #f44336; }   /* human wins  = bad for AI */
+    .draw-val  { color: #888; }
+    .loss-val  { color: #4caf50; }   /* human loses = good for AI */
+
+    /* Status */
+    #status {
+      font-size: 0.85rem;
+      min-height: 1.4em;
+      color: #aaa;
+    }
+    #status.thinking { color: #ffb300; animation: pulse 1s infinite; }
+    #status.win      { color: #4caf50; font-weight: bold; }
+    #status.lose     { color: #f44336; font-weight: bold; }
+    #status.draw     { color: #888; font-weight: bold; }
+
+    /* Move history */
+    #move-list {
+      font-size: 0.8rem;
+      line-height: 1.8;
+      color: #aaa;
+      max-height: 180px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+    }
+    #move-list span.white { color: #ddd; }
+    #move-list span.black { color: #888; }
+
+    /* Buttons */
+    button {
+      width: 100%;
+      padding: 12px;
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-radius: 4px;
+      color: #ccc;
+      font-family: inherit;
+      font-size: 0.85rem;
+      letter-spacing: 0.1em;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    button:hover { background: #222; border-color: #555; color: #fff; }
+    button:active { background: #2a2a2a; }
+
+    /* Self-play indicator */
+    .selfplay-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.7rem;
+      color: #555;
+    }
+    .dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: #555;
+      flex-shrink: 0;
+    }
+    .dot.active { background: #4caf50; animation: pulse 1.2s infinite; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.3; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>W A R G A M E S</h1>
+  <p>Chess DQN · You are White · The AI learns from every game</p>
+</header>
+
+<div class="container">
+  <!-- Board -->
+  <div id="board"></div>
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+
+    <!-- Elo + stats -->
+    <div class="card">
+      <h3>AI Performance</h3>
+      <div class="stats-grid">
+        <div class="stat">
+          <div class="value" id="elo-value">—</div>
+          <div class="label">Elo</div>
+        </div>
+        <div class="stat">
+          <div class="value" id="total-games">—</div>
+          <div class="label">Total Games</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- vs Human record -->
+    <div class="card">
+      <h3>vs Humans</h3>
+      <div class="record">
+        <div>
+          <div class="val win-val"  id="h-wins">0</div>
+          <div class="lbl">You Won</div>
+        </div>
+        <div>
+          <div class="val draw-val" id="h-draws">0</div>
+          <div class="lbl">Draws</div>
+        </div>
+        <div>
+          <div class="val loss-val" id="h-losses">0</div>
+          <div class="lbl">AI Won</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Game status -->
+    <div class="card">
+      <h3>Status</h3>
+      <div id="status">Press New Game to play.</div>
+    </div>
+
+    <!-- Move history -->
+    <div class="card">
+      <h3>Move History</h3>
+      <div id="move-list"></div>
+    </div>
+
+    <!-- Controls -->
+    <div class="card">
+      <h3>Controls</h3>
+      <button id="btn-new">New Game</button>
+    </div>
+
+    <!-- Self-play indicator -->
+    <div class="selfplay-row">
+      <div class="dot" id="sp-dot"></div>
+      <span id="sp-label">Self-play: —</span>
+    </div>
+
+  </div><!-- /sidebar -->
+</div><!-- /container -->
+
+
+<!-- JS Libraries -->
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
+<!-- chess.js for local move validation -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+
+<script>
+  // ── Local chess.js mirror ─────────────────────────────────────────
+  let game    = new Chess();
+  let board   = null;
+  let busy    = false;   // prevents moves while AI is thinking or game is over
+  let active  = false;   // whether a game is in progress
+
+  // ── Board initialisation ──────────────────────────────────────────
+  function initBoard() {
+    board = Chessboard('board', {
+      draggable:   true,
+      position:    'start',
+      orientation: 'white',
+      pieceTheme:  'https://lichess1.org/assets/piece/cburnett/{piece}.svg',
+      onDragStart: onDragStart,
+      onDrop:      onDrop,
+      onSnapEnd:   () => board.position(game.fen()),
+    });
+  }
+
+  function onDragStart(source, piece) {
+    if (!active || busy || game.game_over()) return false;
+    if (game.turn() !== 'w') return false;      // only white's pieces
+    if (piece.startsWith('b')) return false;
+    return true;
+  }
+
+  async function onDrop(source, target) {
+    if (busy || !active) return 'snapback';
+
+    // Auto-promote to queen
+    const uci = source + target;
+    const move = game.move({ from: source, to: target, promotion: 'q' });
+    if (!move) return 'snapback';
+
+    busy = true;
+    setStatus('Sending move…');
+
+    try {
+      // 1. Send human move
+      const uciStr = move.from + move.to + (move.promotion || '');
+      const resp = await api('POST', '/api/move', { move: uciStr });
+
+      if (resp.status === 'game_over') {
+        board.position(resp.fen);
+        handleGameOver(resp.outcome);
+        return;
+      }
+
+      // 2. Request AI move
+      const gpuNote = (await api('GET', '/api/stats')).device === 'cpu'
+        ? ' (~10s on CPU)' : '';
+      setStatus(`AI thinking…${gpuNote}`, 'thinking');
+      const aiResp = await api('GET', '/api/ai-move');
+
+      // Update local chess.js state
+      const aiFrom = aiResp.move.slice(0, 2);
+      const aiTo   = aiResp.move.slice(2, 4);
+      const aiProm = aiResp.move.length > 4 ? aiResp.move[4] : 'q';
+      game.move({ from: aiFrom, to: aiTo, promotion: aiProm });
+      board.position(game.fen());
+
+      updateMoveHistory();
+
+      if (aiResp.status === 'game_over') {
+        handleGameOver(aiResp.outcome);
+      } else {
+        setStatus('Your turn (White)');
+      }
+    } catch (err) {
+      console.error(err);
+      setStatus('Error — see console');
+    } finally {
+      busy = false;
+    }
+  }
+
+  function handleGameOver(outcome) {
+    active = false;
+    if (outcome === 'white') {
+      setStatus('You win! 🎉', 'win');
+    } else if (outcome === 'black') {
+      setStatus('AI wins.', 'lose');
+    } else {
+      setStatus('Draw.', 'draw');
+    }
+    refreshStats();
+  }
+
+  // ── New game ───────────────────────────────────────────────────────
+  document.getElementById('btn-new').addEventListener('click', async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      await api('POST', '/api/new-game');
+      game.reset();
+      board.start();
+      active = true;
+      document.getElementById('move-list').innerHTML = '';
+      setStatus('Your turn (White)');
+    } catch (err) {
+      console.error(err);
+      setStatus('Failed to start game');
+    } finally {
+      busy = false;
+    }
+  });
+
+  // ── Move history ───────────────────────────────────────────────────
+  function updateMoveHistory() {
+    const history = game.history();
+    const el = document.getElementById('move-list');
+    let html = '';
+    for (let i = 0; i < history.length; i += 2) {
+      const n = Math.floor(i / 2) + 1;
+      const w = `<span class="white">${history[i]}</span>`;
+      const b = history[i + 1]
+        ? ` <span class="black">${history[i + 1]}</span>`
+        : '';
+      html += `<div>${n}. ${w}${b}</div>`;
+    }
+    el.innerHTML = html;
+    el.scrollTop = el.scrollHeight;
+  }
+
+  // ── Status helper ──────────────────────────────────────────────────
+  function setStatus(msg, cls = '') {
+    const el = document.getElementById('status');
+    el.textContent  = msg;
+    el.className    = cls;
+  }
+
+  // ── API helper ─────────────────────────────────────────────────────
+  async function api(method, path, body) {
+    const opts = { method, headers: {} };
+    if (body) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
+    }
+    const res = await fetch(path, opts);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || res.statusText);
+    }
+    return res.json();
+  }
+
+  // ── Stats polling ─────────────────────────────────────────────────
+  async function refreshStats() {
+    try {
+      const s = await api('GET', '/api/stats');
+      document.getElementById('elo-value').textContent   = s.ai_elo;
+      document.getElementById('total-games').textContent = s.total_games.toLocaleString();
+      document.getElementById('h-wins').textContent      = s.human_wins;
+      document.getElementById('h-draws').textContent     = s.human_draws;
+      document.getElementById('h-losses').textContent    = s.human_losses;
+
+      // Self-play indicator
+      const dot   = document.getElementById('sp-dot');
+      const label = document.getElementById('sp-label');
+      const selfplaying = !s.human_game_active;
+      dot.className   = 'dot' + (selfplaying ? ' active' : '');
+      label.textContent = `Self-play: ${s.selfplay_games.toLocaleString()} games  ε=${s.epsilon}`;
+    } catch (_) { /* ignore — server might be starting up */ }
+  }
+
+  // ── Boot ───────────────────────────────────────────────────────────
+  initBoard();
+  refreshStats();
+  setInterval(refreshStats, 4000);
+</script>
+</body>
+</html>
