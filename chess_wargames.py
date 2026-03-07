@@ -160,7 +160,7 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
     records = []   # (state_array, policy_array, player_color)
     move_n  = 0
 
-    while not board.is_game_over() and not board.can_claim_draw() and move_n < MAX_MOVES:
+    while not board.is_game_over() and move_n < MAX_MOVES:
         # Try book move first (early game diversity)
         book_mv = _book_move(board)
         if book_mv is not None:
