@@ -12,14 +12,17 @@ Board is encoded as a 19×8×8 tensor:
   Plane  17    : en passant target square
   Plane  18    : position has been seen before in this game (draw pressure)
 
-Moves are encoded as integers 0–4095  (from_square * 64 + to_square).
-Promotions are always to queen.
+Move encoding (ACTION_SIZE = 8192):
+  0–4095    : standard moves  (from_square * 64 + to_square)
+              queen promotion is implicit for pawns reaching the last rank.
+  4096–8191 : knight underpromotions  (4096 + from_square * 64 + to_square)
 """
 
 import chess
 import numpy as np
 
 INPUT_PLANES = 19
+ACTION_SIZE  = 8192   # 4096 standard + 4096 knight underpromotions
 
 # piece_type (1-indexed) → plane offset
 _PT_OFFSET = {
@@ -63,28 +66,39 @@ def encode(board: chess.Board) -> np.ndarray:
     return planes
 
 
+def move_to_idx(mv: chess.Move) -> int:
+    """Encode a chess.Move to an action index (0–8191)."""
+    base = mv.from_square * 64 + mv.to_square
+    return 4096 + base if mv.promotion == chess.KNIGHT else base
+
+
 def legal_mask(board: chess.Board) -> np.ndarray:
-    """Return (4096,) float32 mask: 1 for each legal move index."""
-    mask = np.zeros(4096, dtype=np.float32)
+    """Return (ACTION_SIZE,) float32 mask: 1 for each legal move index."""
+    mask = np.zeros(ACTION_SIZE, dtype=np.float32)
     for mv in board.legal_moves:
-        # Collapse all promotions to queen — same (from, to) index
-        if mv.promotion is None or mv.promotion == chess.QUEEN:
-            mask[mv.from_square * 64 + mv.to_square] = 1.0
+        mask[move_to_idx(mv)] = 1.0
     return mask
 
 
-def idx_to_move(idx: int, board: chess.Board) -> chess.Move:
-    """Convert a move index back to a legal chess.Move (queen promotion if needed)."""
-    from_sq, to_sq = idx >> 6, idx & 63
-    for promo in (None, chess.QUEEN):
-        mv = chess.Move(from_sq, to_sq, promotion=promo)
-        if mv in board.legal_moves:
-            return mv
-    # Fallback: scan legal moves for matching squares
-    for mv in board.legal_moves:
-        if mv.from_square == from_sq and mv.to_square == to_sq:
-            return mv
-    return None
+def idx_to_move(idx: int, board: chess.Board) -> chess.Move | None:
+    """Convert an action index back to a legal chess.Move."""
+    if idx >= 4096:
+        base    = idx - 4096
+        from_sq = base >> 6
+        to_sq   = base & 63
+        mv = chess.Move(from_sq, to_sq, promotion=chess.KNIGHT)
+        return mv if mv in board.legal_moves else None
+
+    from_sq = idx >> 6
+    to_sq   = idx & 63
+    piece   = board.piece_at(from_sq)
+    if piece and piece.piece_type == chess.PAWN:
+        if (piece.color == chess.WHITE and chess.square_rank(to_sq) == 7) or \
+           (piece.color == chess.BLACK and chess.square_rank(to_sq) == 0):
+            mv = chess.Move(from_sq, to_sq, promotion=chess.QUEEN)
+            return mv if mv in board.legal_moves else None
+    mv = chess.Move(from_sq, to_sq)
+    return mv if mv in board.legal_moves else None
 
 
 def mirror_sample(state: np.ndarray, policy: np.ndarray, value: float):
@@ -114,7 +128,12 @@ def mirror_sample(state: np.ndarray, policy: np.ndarray, value: float):
     mp = np.zeros_like(policy)
     for idx in np.nonzero(policy)[0]:
         idx = int(idx)
-        new_idx = (idx >> 6 ^ 7) * 64 + (idx & 63 ^ 7)
-        mp[new_idx] = policy[idx]
+        if idx >= 4096:
+            base     = idx - 4096
+            new_base = (base >> 6 ^ 7) * 64 + (base & 63 ^ 7)
+            mp[4096 + new_base] = policy[idx]
+        else:
+            new_idx = (idx >> 6 ^ 7) * 64 + (idx & 63 ^ 7)
+            mp[new_idx] = policy[idx]
 
     return ms, mp, value

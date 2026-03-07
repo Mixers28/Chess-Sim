@@ -34,7 +34,7 @@ from pydantic import BaseModel
 
 import chess_model as M
 from chess_model import load_checkpoint, save_checkpoint
-from chess_env import encode, idx_to_move, legal_mask, mirror_sample
+from chess_env import encode, idx_to_move, move_to_idx, legal_mask, mirror_sample, ACTION_SIZE
 from chess_mcts import MCTS
 from chess_wargames import az_update, selfplay_game
 
@@ -90,7 +90,7 @@ def _finalize_human_game():
     current_game.outcome = result
 
     # Build training samples from human game trajectories
-    dummy_policy = np.zeros(4096, dtype=np.float32)
+    dummy_policy = np.zeros(ACTION_SIZE, dtype=np.float32)
 
     for traj, reward in [(current_game.traj_w, w_r), (current_game.traj_b, b_r)]:
         for state, policy in traj:
@@ -343,8 +343,7 @@ async def human_move(req: MoveRequest):
 
         # Advance MCTS tree to match human's move
         if current_game.mcts_root is not None:
-            a_human = mv.from_square * 64 + mv.to_square
-            current_game.mcts_root = current_game.mcts_root.children.get(a_human)
+            current_game.mcts_root = current_game.mcts_root.children.get(move_to_idx(mv))
 
         current_game.board.push(mv)
         current_game.move_history.append(mv.uci())
@@ -371,6 +370,19 @@ async def ai_move():
         state          = encode(board_snapshot)
         n_sims         = current_game.n_sims
         prev_root      = current_game.mcts_root
+
+    # Claim a draw if available and the position is not winning for the AI
+    if board_snapshot.can_claim_draw():
+        state_t = torch.tensor(encode(board_snapshot), dtype=torch.float32) \
+                       .unsqueeze(0).to(M.device)
+        with torch.no_grad(), M.model_lock:
+            _, val_t = M.policy_net(state_t)
+        # val_t is from current player's (black/AI) perspective; claim if not winning
+        if val_t.item() < 0.1:
+            with game_lock:
+                _finalize_human_game()
+            return {"move": None, "status": "game_over", "outcome": "draw",
+                    "fen": board_snapshot.fen(), "pv": []}
 
     # Run MCTS outside the lock (slow path) — reuse tree if available
     mcts = MCTS(M.policy_net, M.device, n_sims=n_sims)

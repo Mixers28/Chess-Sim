@@ -23,7 +23,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from chess_env import encode, idx_to_move, legal_mask
+from chess_env import encode, idx_to_move, legal_mask, ACTION_SIZE
 
 
 class MCTSNode:
@@ -101,6 +101,8 @@ class MCTS:
         if sim_board.is_game_over():
             outcome = sim_board.outcome()
             value = 0.0 if outcome.winner is None else -1.0
+        elif sim_board.can_claim_draw():
+            value = 0.0
         else:
             priors, value = self._evaluate(sim_board)
             for a in np.where(priors > 0)[0]:
@@ -152,7 +154,7 @@ class MCTS:
             self._simulate(root, board)
 
         # Build visit count vector
-        counts = np.zeros(4096, dtype=np.float32)
+        counts = np.zeros(ACTION_SIZE, dtype=np.float32)
         for a, child in root.children.items():
             counts[a] = child.N
 

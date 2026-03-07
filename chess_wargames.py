@@ -12,6 +12,8 @@ Training data per game:
 """
 
 import atexit
+import math
+import random
 import time
 
 import chess
@@ -21,18 +23,105 @@ import torch.nn.functional as F
 
 import chess_model as M
 from chess_model import save_checkpoint, load_checkpoint
-from chess_env import encode, idx_to_move, legal_mask, mirror_sample
+from chess_env import encode, idx_to_move, move_to_idx, legal_mask, mirror_sample, ACTION_SIZE
 from chess_mcts import MCTS
 
 # ── Hyperparameters ────────────────────────────────────────────────────
-TOTAL_GAMES   = 10_000
-REPORT_EVERY  = 10        # games between CLI status lines
-BATCH_SIZE    = 512
-TRAIN_STEPS   = 5         # gradient steps after each game
-MCTS_SIMS     = 100       # simulations per move during self-play
-TEMP_THRESHOLD = 30       # moves before temperature → 0
-MAX_MOVES     = 150       # half-moves per game cap
-SAVE_EVERY    = 50        # games between checkpoint saves
+TOTAL_GAMES  = 10_000
+REPORT_EVERY = 10         # games between CLI status lines
+BATCH_SIZE   = 512
+TRAIN_STEPS  = 5          # gradient steps after each game
+MCTS_SIMS    = 100        # simulations per move during self-play
+MAX_MOVES    = 150        # half-moves per game cap
+SAVE_EVERY   = 50         # games between checkpoint saves
+
+# Temperature decays exponentially: τ(n) = max(0.05, exp(-n / TEMP_DECAY))
+# At move 15: ~0.37  |  move 30: ~0.14  |  move 45: ~0.05 (floor)
+TEMP_DECAY   = 20.0
+
+
+# ── Opening book ───────────────────────────────────────────────────────
+# Key: first two FEN fields (piece placement + side to move).
+# Value: list of UCI moves to pick uniformly at random (duplicates = weight).
+_OPENING_BOOK: dict[str, list[str]] = {
+    # Move 1 — white (weight e4/d4 higher)
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w": [
+        "e2e4", "e2e4", "e2e4",
+        "d2d4", "d2d4",
+        "c2c4", "g1f3",
+    ],
+    # Move 1 — black responses to 1.e4
+    "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b": [
+        "e7e5", "e7e5", "c7c5", "c7c5",
+        "e7e6", "c7c6", "d7d5", "g8f6",
+    ],
+    # Move 1 — black responses to 1.d4
+    "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b": [
+        "d7d5", "d7d5", "g8f6", "g8f6",
+        "e7e6", "f7f5",
+    ],
+    # Move 1 — black responses to 1.c4
+    "rnbqkbnr/pppppppp/8/8/2P5/8/PP1PPPPP/RNBQKBNR b": [
+        "e7e5", "c7c5", "g8f6", "e7e6",
+    ],
+    # Move 1 — black responses to 1.Nf3
+    "rnbqkbnr/pppppppp/8/8/8/5N2/PPPPPPPP/RNBQKB1R b": [
+        "d7d5", "g8f6", "c7c5", "e7e6",
+    ],
+    # After 1.e4 e5 — white move 2
+    "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w": [
+        "g1f3", "g1f3", "b1c3", "f2f4",
+    ],
+    # After 1.e4 c5 (Sicilian) — white move 2
+    "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w": [
+        "g1f3", "g1f3", "b1c3", "f2f4",
+    ],
+    # After 1.e4 e6 (French) — white move 2
+    "rnbqkbnr/pppp1ppp/4p3/8/4P3/8/PPPP1PPP/RNBQKBNR w": [
+        "d2d4", "d2d4", "g1f3",
+    ],
+    # After 1.e4 c6 (Caro-Kann) — white move 2
+    "rnbqkbnr/pp1ppppp/2p5/8/4P3/8/PPPP1PPP/RNBQKBNR w": [
+        "d2d4", "d2d4", "b1c3", "g1f3",
+    ],
+    # After 1.e4 d5 (Scandinavian) — white move 2
+    "rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR w": [
+        "e4d5", "e4d5", "b1c3", "e4e5",
+    ],
+    # After 1.d4 d5 — white move 2
+    "rnbqkbnr/ppp1pppp/8/3p4/3P4/8/PPP1PPPP/RNBQKBNR w": [
+        "c2c4", "c2c4", "g1f3", "e2e3",
+    ],
+    # After 1.d4 Nf6 — white move 2
+    "rnbqkb1r/pppppppp/5n2/8/3P4/8/PPP1PPPP/RNBQKBNR w": [
+        "c2c4", "c2c4", "g1f3", "c1g5",
+    ],
+    # After 1.e4 e5 2.Nf3 — black move 2
+    "rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b": [
+        "b8c6", "b8c6", "g8f6", "d7d6",
+    ],
+    # After 1.d4 d5 2.c4 (Queen's Gambit) — black move 2
+    "rnbqkbnr/ppp1pppp/8/3p4/2PP4/8/PP2PPPP/RNBQKBNR b": [
+        "e7e6", "e7e6", "c7c6", "d5c4",
+    ],
+}
+
+
+def _book_key(board: chess.Board) -> str:
+    parts = board.fen().split()
+    return parts[0] + " " + parts[1]
+
+
+def _book_move(board: chess.Board) -> chess.Move | None:
+    """Return a random legal book move for the current position, or None."""
+    if board.fullmove_number > 8:
+        return None
+    candidates = [
+        chess.Move.from_uci(uci)
+        for uci in _OPENING_BOOK.get(_book_key(board), [])
+    ]
+    legal = [mv for mv in candidates if mv in board.legal_moves]
+    return random.choice(legal) if legal else None
 
 
 # ── AlphaZero training step ────────────────────────────────────────────
@@ -71,8 +160,21 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
     records = []   # (state_array, policy_array, player_color)
     move_n  = 0
 
-    while not board.is_game_over() and move_n < MAX_MOVES:
-        temp = 1.0 if move_n < TEMP_THRESHOLD else 0.0
+    while not board.is_game_over() and not board.can_claim_draw() and move_n < MAX_MOVES:
+        # Try book move first (early game diversity)
+        book_mv = _book_move(board)
+        if book_mv is not None:
+            policy_target = np.zeros(ACTION_SIZE, dtype=np.float32)
+            policy_target[move_to_idx(book_mv)] = 1.0
+            records.append((encode(board), policy_target, board.turn))
+            board.push(book_mv)
+            move_n += 1
+            if position_cb is not None:
+                position_cb(board.fen(), book_mv.uci(), move_n)
+            continue
+
+        # Smooth exponential temperature decay: high early, low late
+        temp = max(0.05, math.exp(-move_n / TEMP_DECAY))
         action, counts, _ = mcts.get_policy(board, temperature=temp, add_noise=True)
 
         # Normalise visit counts → policy target
@@ -83,7 +185,6 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
 
         mv = idx_to_move(action, board)
         if mv is None:
-            import random
             mv = random.choice(list(board.legal_moves))
         board.push(mv)
         move_n += 1
@@ -91,11 +192,10 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
         if position_cb is not None:
             position_cb(board.fen(), mv.uci(), move_n)
 
-    # Determine outcome
+    # Determine outcome (can_claim_draw or move cap → draw)
     outcome = board.outcome()
     if outcome is None:
-        result = "D"
-        winner = None
+        result, winner = "D", None   # claimed draw or move cap
     elif outcome.winner == chess.WHITE:
         result, winner = "W", chess.WHITE
     elif outcome.winner == chess.BLACK:

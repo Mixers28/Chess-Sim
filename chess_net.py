@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from chess_env import INPUT_PLANES
+from chess_env import INPUT_PLANES, ACTION_SIZE
 
 
 class SEBlock(nn.Module):
@@ -84,7 +84,7 @@ class AlphaZeroNet(nn.Module):
             nn.BatchNorm2d(2),
             nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(2 * 8 * 8, 4096),
+            nn.Linear(2 * 8 * 8, ACTION_SIZE),
         )
 
         # Value head
