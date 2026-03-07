@@ -21,6 +21,7 @@ import os
 import random
 import threading
 import time
+import traceback
 from contextlib import asynccontextmanager
 
 import chess
@@ -122,6 +123,9 @@ def _finalize_human_game():
 
 
 # ── Background self-play thread ────────────────────────────────────────
+_sp_thread: threading.Thread | None = None   # module-level for watchdog access
+
+
 def selfplay_loop():
     board = chess.Board()
     mcts  = MCTS(M.policy_net, M.device, n_sims=MCTS_SIMS_SP)
@@ -131,36 +135,50 @@ def selfplay_loop():
             time.sleep(0.1)
             continue
 
-        M.policy_net.eval()
+        try:
+            M.policy_net.eval()
 
-        # Broadcast each move to live SSE stream
-        def _broadcast(fen, move_uci, move_n):
-            with _sp_lock:
-                _sp_state.update({
-                    "fen":    fen,
-                    "move":   move_uci,
-                    "game":   M.selfplay_games,
-                    "move_n": move_n,
-                })
+            def _broadcast(fen, move_uci, move_n):
+                with _sp_lock:
+                    _sp_state.update({
+                        "fen":    fen,
+                        "move":   move_uci,
+                        "game":   M.selfplay_games,
+                        "move_n": move_n,
+                    })
 
-        samples, _, _ = selfplay_game(board, mcts, position_cb=_broadcast)
+            samples, _, _ = selfplay_game(board, mcts, position_cb=_broadcast)
 
-        for state, policy, value in samples:
-            M.replay_buf.push(state, policy, value)
-            M.replay_buf.push(*mirror_sample(state, policy, value))
+            for state, policy, value in samples:
+                M.replay_buf.push(state, policy, value)
+                M.replay_buf.push(*mirror_sample(state, policy, value))
 
-        with M.model_lock:
-            for _ in range(TRAIN_STEPS):
-                az_update(M.policy_net, M.replay_buf, M.optimizer, M.scheduler)
+            with M.model_lock:
+                for _ in range(TRAIN_STEPS):
+                    az_update(M.policy_net, M.replay_buf, M.optimizer, M.scheduler)
 
-        M.total_games    += 1
-        M.selfplay_games += 1
+            M.total_games    += 1
+            M.selfplay_games += 1
 
-        if M.selfplay_games % SAVE_EVERY_SP == 0:
-            save_checkpoint()
+            if M.selfplay_games % SAVE_EVERY_SP == 0:
+                save_checkpoint()
+
+        except Exception:
+            print("[selfplay] Error — resetting board and continuing:", flush=True)
+            traceback.print_exc()
+            board.reset()
+            time.sleep(1)
 
 
 # ── App lifespan ──────────────────────────────────────────────────────
+def _start_selfplay_thread() -> threading.Thread:
+    global _sp_thread
+    t = threading.Thread(target=selfplay_loop, daemon=True, name="selfplay")
+    t.start()
+    _sp_thread = t
+    return t
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not load_checkpoint():
@@ -169,8 +187,7 @@ async def lifespan(app: FastAPI):
     M.policy_net.eval()
     atexit.register(save_checkpoint)
 
-    sp = threading.Thread(target=selfplay_loop, daemon=True, name="selfplay")
-    sp.start()
+    _start_selfplay_thread()
 
     dev_str = str(M.device).upper()
     print(f"[app] AlphaZero+SE | {M.AZ_RES_BLOCKS} res blocks | "
@@ -178,9 +195,19 @@ async def lifespan(app: FastAPI):
     if M.device.type == "cpu":
         print("[app] ⚠  GPU strongly recommended — self-play will be slow on CPU")
 
+    async def _watchdog():
+        while not M.shutdown_flag:
+            await asyncio.sleep(30)
+            if _sp_thread and not _sp_thread.is_alive() and not M.shutdown_flag:
+                print("[app] Selfplay thread died — restarting", flush=True)
+                _start_selfplay_thread()
+
+    wd = asyncio.create_task(_watchdog())
+
     yield
 
     M.shutdown_flag = True
+    wd.cancel()
     save_checkpoint()
 
 
@@ -223,6 +250,7 @@ async def get_stats():
         "replay_buffer":     len(M.replay_buf),
         "human_game_active": M.human_game_active.is_set(),
         "device":            str(M.device),
+        "selfplay_alive":    _sp_thread is not None and _sp_thread.is_alive(),
     }
 
 
