@@ -32,12 +32,17 @@ REPORT_EVERY = 10         # games between CLI status lines
 BATCH_SIZE   = 512
 TRAIN_STEPS  = 5          # gradient steps after each game
 MCTS_SIMS    = 100        # simulations per move during self-play
-MAX_MOVES    = 150        # half-moves per game cap
+MAX_MOVES    = 80         # half-moves per game cap
 SAVE_EVERY   = 50         # games between checkpoint saves
 
 # Temperature decays exponentially: τ(n) = max(0.05, exp(-n / TEMP_DECAY))
 # At move 15: ~0.37  |  move 30: ~0.14  |  move 45: ~0.05 (floor)
 TEMP_DECAY   = 20.0
+
+# Resign: if MCTS root value stays below this for RESIGN_CONSECUTIVE moves, resign.
+# Won't trigger until the value head learns to produce values near ±1.
+RESIGN_THRESHOLD   = -0.9
+RESIGN_CONSECUTIVE = 5
 
 
 # ── Opening book ───────────────────────────────────────────────────────
@@ -157,8 +162,10 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
                  used by the web server to broadcast live positions.
     """
     board.reset()
-    records = []   # (state_array, policy_array, player_color)
-    move_n  = 0
+    records        = []    # (state_array, policy_array, player_color)
+    move_n         = 0
+    consecutive_low = 0   # consecutive moves where root value < RESIGN_THRESHOLD
+    resigned       = False
 
     while not board.is_game_over() and move_n < MAX_MOVES:
         # Try book move first (early game diversity)
@@ -175,7 +182,23 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
 
         # Smooth exponential temperature decay: high early, low late
         temp = max(0.05, math.exp(-move_n / TEMP_DECAY))
-        action, counts, _ = mcts.get_policy(board, temperature=temp, add_noise=True)
+        action, counts, root = mcts.get_policy(board, temperature=temp, add_noise=True)
+
+        # Compute root value from MCTS tree (weighted avg of children Q, negated)
+        total_n = sum(c.N for c in root.children.values())
+        if total_n > 0:
+            root_value = -sum(c.Q * c.N for c in root.children.values()) / total_n
+        else:
+            root_value = 0.0
+
+        # Resign check — activates naturally once value head produces values near ±1
+        if root_value < RESIGN_THRESHOLD:
+            consecutive_low += 1
+            if consecutive_low >= RESIGN_CONSECUTIVE:
+                resigned = True
+                break
+        else:
+            consecutive_low = 0
 
         # Normalise visit counts → policy target
         total = counts.sum()
@@ -192,16 +215,21 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
         if position_cb is not None:
             position_cb(board.fen(), mv.uci(), move_n)
 
-    # Determine outcome (can_claim_draw or move cap → draw)
-    outcome = board.outcome()
-    if outcome is None:
-        result, winner = "D", None   # claimed draw or move cap
-    elif outcome.winner == chess.WHITE:
-        result, winner = "W", chess.WHITE
-    elif outcome.winner == chess.BLACK:
-        result, winner = "B", chess.BLACK
+    # Determine outcome
+    if resigned:
+        # Current player to move lost (they gave up)
+        result = "B" if board.turn == chess.WHITE else "W"
+        winner = chess.BLACK if board.turn == chess.WHITE else chess.WHITE
     else:
-        result, winner = "D", None
+        outcome = board.outcome()
+        if outcome is None:
+            result, winner = "D", None   # move cap
+        elif outcome.winner == chess.WHITE:
+            result, winner = "W", chess.WHITE
+        elif outcome.winner == chess.BLACK:
+            result, winner = "B", chess.BLACK
+        else:
+            result, winner = "D", None
 
     # Build training samples: fill in value_target from each player's perspective
     samples = []

@@ -46,7 +46,7 @@ MCTS_SIMS_HUMAN = 50 if _t.cuda.is_available() else 10
 TRAIN_STEPS     = 5     # gradient steps after each game
 SAVE_EVERY_SP   = 50    # self-play games between saves
 SAVE_EVERY_HU   = 10    # human games between saves
-MAX_MOVES       = 150
+MAX_MOVES       = 80
 
 
 # ── Live self-play state (for SSE stream) ─────────────────────────────
