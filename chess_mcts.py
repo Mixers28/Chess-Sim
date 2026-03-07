@@ -219,7 +219,10 @@ class MCTS:
         if temperature == 0 or temperature < 1e-6:
             action = int(counts.argmax())
         else:
-            probs  = counts ** (1.0 / temperature)
+            # Normalise before raising to power to prevent float32 overflow
+            # at low temperatures (e.g. counts**20 overflows for large visit counts)
+            probs  = counts / counts.max()
+            probs  = probs ** (1.0 / temperature)
             probs /= probs.sum()
             action = int(np.random.choice(len(probs), p=probs))
 
