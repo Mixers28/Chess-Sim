@@ -10,6 +10,9 @@ Q(node) = W/N  →  used in UCB from the parent's perspective.
 
 Backup: value from leaf is from the LEAF player's perspective.
         As we walk up the path, we negate at each step (alternating players).
+
+Tree reuse: get_policy accepts an optional `root` from a previous search.
+            Passing the subtree saves re-exploring already-visited positions.
 """
 
 import math
@@ -76,7 +79,7 @@ class MCTS:
 
     # ── One MCTS simulation ────────────────────────────────────────────
     def _simulate(self, root: MCTSNode, board: chess.Board) -> float:
-        node     = root
+        node      = root
         sim_board = board.copy(stack=False)
         path: list[tuple[MCTSNode, int, MCTSNode]] = []
 
@@ -97,20 +100,15 @@ class MCTS:
         # ── Evaluation ────────────────────────────────────────────────
         if sim_board.is_game_over():
             outcome = sim_board.outcome()
-            # sim_board.turn = the player to move = the one who was just checkmated
-            # (or the stalemated player). In all terminal cases they either lost or drew.
             value = 0.0 if outcome.winner is None else -1.0
         else:
-            # Expand leaf
             priors, value = self._evaluate(sim_board)
             for a in np.where(priors > 0)[0]:
                 node.children[int(a)] = MCTSNode(prior=float(priors[a]))
 
         # ── Backup ────────────────────────────────────────────────────
-        # value is from sim_board.turn's perspective at the leaf.
-        # Walk the path in reverse; negate at each step (perspective switches).
         for parent, action, child in reversed(path):
-            value = -value                # switch perspective to parent's player
+            value = -value
             child.N += 1
             child.W += value
 
@@ -118,21 +116,37 @@ class MCTS:
         return value
 
     # ── Public interface ───────────────────────────────────────────────
-    def get_policy(self, board: chess.Board, temperature: float = 1.0):
+    def get_policy(self, board: chess.Board, temperature: float = 1.0,
+                   add_noise: bool = False, root: MCTSNode = None):
         """
         Run `n_sims` simulations from `board`.
+
+        Args:
+          add_noise — mix Dirichlet noise into root priors (self-play exploration).
+          root      — reuse a subtree from a previous search (tree reuse).
+                      If None or empty, builds a fresh root.
 
         Returns:
           action        — chosen move index (int)
           visit_counts  — np.ndarray shape (4096,), raw visit counts
+          root          — the root MCTSNode (pass back next call for tree reuse)
         """
-        root = MCTSNode(prior=1.0)
+        # Build or reuse root
+        if root is None or not root.children:
+            root = MCTSNode(prior=1.0)
+            priors, _ = self._evaluate(board)
 
-        # Evaluate and expand root before simulations
-        priors, _ = self._evaluate(board)
-        for a in np.where(priors > 0)[0]:
-            root.children[int(a)] = MCTSNode(prior=float(priors[a]))
-        root.N = 1
+            if add_noise:
+                legal_idx = np.where(priors > 0)[0]
+                if len(legal_idx) > 0:
+                    noise = np.random.dirichlet([0.3] * len(legal_idx))
+                    noisy = priors.copy()
+                    noisy[legal_idx] = 0.75 * priors[legal_idx] + 0.25 * noise
+                    priors = noisy
+
+            for a in np.where(priors > 0)[0]:
+                root.children[int(a)] = MCTSNode(prior=float(priors[a]))
+            root.N = 1
 
         for _ in range(self.n_sims):
             self._simulate(root, board)
@@ -142,18 +156,37 @@ class MCTS:
         for a, child in root.children.items():
             counts[a] = child.N
 
-        # Choose action
         if counts.sum() == 0:
-            # Fallback: uniform over legal moves
             mask = legal_mask(board)
             counts = mask
 
         if temperature == 0 or temperature < 1e-6:
             action = int(counts.argmax())
         else:
-            # Sample proportional to counts^(1/temperature)
             probs = counts ** (1.0 / temperature)
             probs /= probs.sum()
             action = int(np.random.choice(len(probs), p=probs))
 
-        return action, counts
+        return action, counts, root
+
+    def get_pv(self, root: MCTSNode, board: chess.Board, depth: int = 6) -> list[str]:
+        """
+        Extract the principal variation by greedily following max visit counts.
+        Returns a list of UCI move strings (may be shorter than depth if game ends).
+        """
+        pv   = []
+        node = root
+        b    = board.copy(stack=False)
+
+        for _ in range(depth):
+            if not node.children or b.is_game_over():
+                break
+            best_a = max(node.children, key=lambda a: node.children[a].N)
+            mv = idx_to_move(best_a, b)
+            if mv is None:
+                break
+            pv.append(mv.uci())
+            b.push(mv)
+            node = node.children[best_a]
+
+        return pv

@@ -14,8 +14,10 @@ from collections import deque
 import numpy as np
 import torch
 import torch.optim as optim
+import torch.optim.lr_scheduler as lr_sched
 
 from chess_net import AlphaZeroNet
+from chess_env import INPUT_PLANES
 
 # ── Device ────────────────────────────────────────────────────────────
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -39,6 +41,12 @@ CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "checkpoint.pt")
 # ── Shared model objects ──────────────────────────────────────────────
 policy_net = AlphaZeroNet(AZ_CHANNELS, AZ_RES_BLOCKS).to(device)
 optimizer  = optim.Adam(policy_net.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+# Cosine annealing with warm restarts: LR decays smoothly then resets.
+# T_0=2000 opt steps per first cycle; each restart doubles the cycle length.
+scheduler  = lr_sched.CosineAnnealingWarmRestarts(
+    optimizer, T_0=2000, T_mult=2, eta_min=1e-5
+)
 
 n_params = sum(p.numel() for p in policy_net.parameters())
 
@@ -79,6 +87,7 @@ human_wins     = 0      # human won
 human_losses   = 0      # AI won
 human_draws    = 0
 ai_elo         = float(ELO_DEFAULT_AI)
+elo_history: list[list] = []   # [[game_n, elo], ...] — recorded after each human game
 
 # ── Concurrency ───────────────────────────────────────────────────────
 model_lock        = threading.Lock()
@@ -95,14 +104,22 @@ def update_elo(current_ai_elo: float,
 
 
 # ── Checkpoint save ───────────────────────────────────────────────────
+def record_elo() -> None:
+    """Append the current (total_games, ai_elo) to elo_history."""
+    global elo_history
+    elo_history.append([total_games, round(ai_elo)])
+
+
 def save_checkpoint() -> None:
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     with model_lock:
         torch.save({
             "policy_state_dict": policy_net.state_dict(),
             "optimizer_state":   optimizer.state_dict(),
+            "scheduler_state":   scheduler.state_dict(),
             "az_channels":       AZ_CHANNELS,
             "az_res_blocks":     AZ_RES_BLOCKS,
+            "az_input_planes":   INPUT_PLANES,
             "total_games":       total_games,
             "selfplay_games":    selfplay_games,
             "human_games":       human_games,
@@ -110,6 +127,7 @@ def save_checkpoint() -> None:
             "human_losses":      human_losses,
             "human_draws":       human_draws,
             "ai_elo":            ai_elo,
+            "elo_history":       elo_history,
         }, CHECKPOINT_PATH)
     print(f"[checkpoint] Saved — games: {total_games:,}  Elo: {ai_elo:.0f}")
 
@@ -117,7 +135,7 @@ def save_checkpoint() -> None:
 # ── Checkpoint load ───────────────────────────────────────────────────
 def load_checkpoint() -> bool:
     global total_games, selfplay_games, human_games
-    global human_wins, human_losses, human_draws, ai_elo
+    global human_wins, human_losses, human_draws, ai_elo, elo_history
 
     if not os.path.exists(CHECKPOINT_PATH):
         return False
@@ -126,12 +144,19 @@ def load_checkpoint() -> bool:
 
     # Verify architecture matches
     if (ckpt.get("az_channels") != AZ_CHANNELS or
-            ckpt.get("az_res_blocks") != AZ_RES_BLOCKS):
+            ckpt.get("az_res_blocks") != AZ_RES_BLOCKS or
+            ckpt.get("az_input_planes") != INPUT_PLANES):
         print("[checkpoint] Architecture mismatch — starting fresh.")
         return False
 
-    policy_net.load_state_dict(ckpt["policy_state_dict"])
-    optimizer.load_state_dict(ckpt["optimizer_state"])
+    try:
+        policy_net.load_state_dict(ckpt["policy_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        if "scheduler_state" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state"])
+    except Exception as e:
+        print(f"[checkpoint] State dict mismatch ({e}) — starting fresh.")
+        return False
 
     total_games    = ckpt.get("total_games",    0)
     selfplay_games = ckpt.get("selfplay_games", 0)
@@ -140,6 +165,7 @@ def load_checkpoint() -> bool:
     human_losses   = ckpt.get("human_losses",   0)
     human_draws    = ckpt.get("human_draws",    0)
     ai_elo         = float(ckpt.get("ai_elo",   ELO_DEFAULT_AI))
+    elo_history    = ckpt.get("elo_history", [])
 
     print(f"[checkpoint] Resuming from game {total_games:,}  (Elo: {ai_elo:.0f})")
     return True

@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 import chess_model as M
 from chess_model import save_checkpoint, load_checkpoint
-from chess_env import encode, idx_to_move, legal_mask
+from chess_env import encode, idx_to_move, legal_mask, mirror_sample
 from chess_mcts import MCTS
 
 # ── Hyperparameters ────────────────────────────────────────────────────
@@ -36,7 +36,7 @@ SAVE_EVERY    = 50        # games between checkpoint saves
 
 
 # ── AlphaZero training step ────────────────────────────────────────────
-def az_update(net, buf, opt) -> float | None:
+def az_update(net, buf, opt, sched=None) -> float | None:
     if len(buf) < BATCH_SIZE:
         return None
 
@@ -46,21 +46,26 @@ def az_update(net, buf, opt) -> float | None:
 
     policy_loss = -(policies * F.log_softmax(policy_logits, dim=1)).sum(dim=1).mean()
     value_loss  = F.mse_loss(value_pred, values)
-    loss        = policy_loss + value_loss
+    loss        = policy_loss + 0.5 * value_loss   # λ=0.5 prevents value head dominating
 
     opt.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
     opt.step()
+    if sched is not None:
+        sched.step()
     net.eval()
     return loss.item()
 
 
 # ── One self-play game ─────────────────────────────────────────────────
-def selfplay_game(board: chess.Board, mcts: MCTS):
+def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
     """
     Play one game with MCTS.
     Returns list of (state, policy_target, value_target) for training.
+
+    position_cb: optional callable(fen, move_uci, move_n) called after each move,
+                 used by the web server to broadcast live positions.
     """
     board.reset()
     records = []   # (state_array, policy_array, player_color)
@@ -68,7 +73,7 @@ def selfplay_game(board: chess.Board, mcts: MCTS):
 
     while not board.is_game_over() and move_n < MAX_MOVES:
         temp = 1.0 if move_n < TEMP_THRESHOLD else 0.0
-        action, counts = mcts.get_policy(board, temperature=temp)
+        action, counts, _ = mcts.get_policy(board, temperature=temp, add_noise=True)
 
         # Normalise visit counts → policy target
         total = counts.sum()
@@ -82,6 +87,9 @@ def selfplay_game(board: chess.Board, mcts: MCTS):
             mv = random.choice(list(board.legal_moves))
         board.push(mv)
         move_n += 1
+
+        if position_cb is not None:
+            position_cb(board.fen(), mv.uci(), move_n)
 
     # Determine outcome
     outcome = board.outcome()
@@ -145,15 +153,16 @@ def train():
     for game_n in range(start, start + TOTAL_GAMES):
         samples, result, n_moves = selfplay_game(board, mcts)
 
-        # Store samples
+        # Store samples + mirrored augmentations (free 2× data)
         for state, policy, value in samples:
             buf.push(state, policy, value)
+            buf.push(*mirror_sample(state, policy, value))
 
         # Gradient updates
         last_loss = None
         with M.model_lock:
             for _ in range(TRAIN_STEPS):
-                l = az_update(net, buf, opt)
+                l = az_update(net, buf, opt, M.scheduler)
                 if l is not None:
                     last_loss = l
 

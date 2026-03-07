@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>WARGAMES — Chess AI</title>
 
-  <!-- chessboard.js -->
   <link rel="stylesheet"
     href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
 
@@ -24,129 +23,175 @@
 
     header {
       width: 100%;
-      padding: 18px 32px;
+      padding: 14px 32px;
       border-bottom: 1px solid #222;
       text-align: center;
     }
-    header h1 {
-      font-size: 1.4rem;
-      letter-spacing: 0.25em;
-      color: #fff;
-    }
-    header p {
-      font-size: 0.75rem;
-      color: #666;
-      margin-top: 4px;
-      letter-spacing: 0.1em;
-    }
+    header h1 { font-size: 1.4rem; letter-spacing: 0.25em; color: #fff; }
+    header p  { font-size: 0.72rem; color: #555; margin-top: 3px; letter-spacing: 0.1em; }
 
+    /* ── Tabs ── */
+    .tab-bar {
+      display: flex;
+      gap: 0;
+      border-bottom: 1px solid #222;
+      width: 100%;
+      justify-content: center;
+    }
+    .tab-btn {
+      background: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: #555;
+      font-family: inherit;
+      font-size: 0.75rem;
+      letter-spacing: 0.18em;
+      padding: 10px 28px;
+      cursor: pointer;
+      transition: color 0.15s, border-color 0.15s;
+      width: auto;
+    }
+    .tab-btn:hover { color: #aaa; }
+    .tab-btn.active { color: #fff; border-bottom-color: #fff; }
+
+    .tab-content { display: none; width: 100%; }
+    .tab-content.active { display: flex; justify-content: center; }
+
+    /* ── Shared layout ── */
     .container {
       display: flex;
-      gap: 32px;
-      padding: 32px;
-      max-width: 900px;
+      gap: 28px;
+      padding: 28px;
+      max-width: 920px;
       width: 100%;
       align-items: flex-start;
     }
 
-    /* ── Board ── */
-    #board { width: 420px; flex-shrink: 0; }
+    /* ── Board column ── */
+    .board-col { display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; }
+    #board, #live-board { width: 420px; }
+
+    /* ── Eval bar ── */
+    .eval-bar-wrap {
+      width: 420px;
+      height: 10px;
+      background: #222;
+      border-radius: 3px;
+      overflow: hidden;
+      position: relative;
+    }
+    .eval-bar-white {
+      position: absolute;
+      top: 0; left: 0;
+      height: 100%;
+      background: #e0e0e0;
+      transition: width 0.4s ease;
+      width: 50%;
+    }
+    .eval-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.6rem;
+      color: #444;
+      padding: 0 2px;
+    }
 
     /* ── Sidebar ── */
     .sidebar {
       flex: 1;
       display: flex;
       flex-direction: column;
-      gap: 20px;
-      min-width: 220px;
+      gap: 16px;
+      min-width: 210px;
     }
 
     .card {
       background: #111;
       border: 1px solid #222;
       border-radius: 6px;
-      padding: 16px;
+      padding: 14px;
     }
     .card h3 {
-      font-size: 0.7rem;
+      font-size: 0.68rem;
       letter-spacing: 0.2em;
-      color: #666;
+      color: #555;
       text-transform: uppercase;
-      margin-bottom: 12px;
+      margin-bottom: 10px;
     }
 
     /* Stats grid */
-    .stats-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-    }
-    .stat {
-      text-align: center;
-    }
-    .stat .value {
-      font-size: 1.5rem;
-      font-weight: bold;
-      color: #fff;
-    }
-    .stat .label {
-      font-size: 0.65rem;
-      color: #555;
-      text-transform: uppercase;
-      letter-spacing: 0.1em;
-      margin-top: 2px;
-    }
+    .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .stat { text-align: center; }
+    .stat .value { font-size: 1.4rem; font-weight: bold; color: #fff; }
+    .stat .label { font-size: 0.62rem; color: #555; text-transform: uppercase; letter-spacing: 0.1em; margin-top: 2px; }
     #elo-value { color: #4caf50; }
 
     /* Record */
-    .record {
-      display: flex;
-      justify-content: space-around;
-      text-align: center;
-    }
-    .record .val { font-size: 1.2rem; font-weight: bold; }
+    .record { display: flex; justify-content: space-around; text-align: center; }
+    .record .val { font-size: 1.1rem; font-weight: bold; }
     .record .lbl { font-size: 0.6rem; color: #555; text-transform: uppercase; }
-    .win-val   { color: #f44336; }   /* human wins  = bad for AI */
-    .draw-val  { color: #888; }
-    .loss-val  { color: #4caf50; }   /* human loses = good for AI */
+    .win-val  { color: #f44336; }
+    .draw-val { color: #888; }
+    .loss-val { color: #4caf50; }
 
     /* Status */
     #status {
-      font-size: 0.85rem;
-      min-height: 1.4em;
+      font-size: 0.83rem;
+      min-height: 1.3em;
       color: #aaa;
     }
     #status.thinking { color: #ffb300; animation: pulse 1s infinite; }
     #status.win      { color: #4caf50; font-weight: bold; }
     #status.lose     { color: #f44336; font-weight: bold; }
-    #status.draw     { color: #888; font-weight: bold; }
+    #status.draw     { color: #888;    font-weight: bold; }
+
+    /* PV */
+    #pv-line {
+      font-size: 0.75rem;
+      color: #666;
+      min-height: 1.2em;
+      word-break: break-all;
+    }
 
     /* Move history */
     #move-list {
-      font-size: 0.8rem;
+      font-size: 0.78rem;
       line-height: 1.8;
       color: #aaa;
-      max-height: 180px;
+      max-height: 160px;
       overflow-y: auto;
       scrollbar-width: thin;
     }
     #move-list span.white { color: #ddd; }
     #move-list span.black { color: #888; }
 
+    /* Difficulty slider */
+    .diff-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .diff-row label { font-size: 0.7rem; color: #666; white-space: nowrap; }
+    .diff-row input[type=range] { flex: 1; accent-color: #4caf50; }
+    #diff-label { font-size: 0.7rem; color: #aaa; min-width: 60px; text-align: right; }
+
     /* Buttons */
     button {
       width: 100%;
-      padding: 12px;
+      padding: 10px;
       background: #1a1a1a;
       border: 1px solid #333;
       border-radius: 4px;
       color: #ccc;
       font-family: inherit;
-      font-size: 0.85rem;
-      letter-spacing: 0.1em;
+      font-size: 0.82rem;
+      letter-spacing: 0.08em;
       cursor: pointer;
       transition: background 0.15s, border-color 0.15s;
+      margin-top: 6px;
     }
+    button:first-child { margin-top: 0; }
     button:hover { background: #222; border-color: #555; color: #fff; }
     button:active { background: #2a2a2a; }
 
@@ -155,274 +200,534 @@
       display: flex;
       align-items: center;
       gap: 8px;
-      font-size: 0.7rem;
-      color: #555;
+      font-size: 0.68rem;
+      color: #444;
     }
-    .dot {
-      width: 7px; height: 7px;
-      border-radius: 50%;
-      background: #555;
-      flex-shrink: 0;
-    }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: #333; flex-shrink: 0; }
     .dot.active { background: #4caf50; animation: pulse 1.2s infinite; }
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50%       { opacity: 0.3; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+    /* ── Live self-play tab ── */
+    #live-info {
+      font-size: 0.78rem;
+      color: #666;
+      margin-top: 6px;
+      text-align: center;
     }
+    #live-move-counter { font-size: 0.68rem; color: #444; text-align: center; margin-top: 4px; }
+
+    /* ── Stats tab ── */
+    .stats-tab-container {
+      padding: 28px;
+      width: 100%;
+      max-width: 820px;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+    .chart-card {
+      background: #111;
+      border: 1px solid #222;
+      border-radius: 6px;
+      padding: 20px;
+    }
+    .chart-card h3 {
+      font-size: 0.68rem;
+      letter-spacing: 0.2em;
+      color: #555;
+      text-transform: uppercase;
+      margin-bottom: 16px;
+    }
+    #elo-chart {
+      width: 100%;
+      height: 220px;
+      display: block;
+    }
+    .chart-empty {
+      color: #333;
+      font-size: 0.8rem;
+      text-align: center;
+      padding: 60px 0;
+    }
+    .training-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+    .training-stat { text-align: center; }
+    .training-stat .val { font-size: 1.6rem; font-weight: bold; color: #fff; }
+    .training-stat .lbl { font-size: 0.62rem; color: #444; text-transform: uppercase; letter-spacing: 0.1em; margin-top: 3px; }
   </style>
 </head>
 <body>
 
 <header>
   <h1>W A R G A M E S</h1>
-  <p>Chess DQN · You are White · The AI learns from every game</p>
+  <p>AlphaZero · You are White · The AI learns from every game</p>
 </header>
 
-<div class="container">
-  <!-- Board -->
-  <div id="board"></div>
+<!-- Tab bar -->
+<div class="tab-bar">
+  <button class="tab-btn active" data-tab="play">PLAY</button>
+  <button class="tab-btn"        data-tab="live">SELF-PLAY</button>
+  <button class="tab-btn"        data-tab="stats">STATS</button>
+</div>
 
-  <!-- Sidebar -->
-  <div class="sidebar">
+<!-- ══ PLAY TAB ══════════════════════════════════════════════════════ -->
+<div id="tab-play" class="tab-content active">
+  <div class="container">
 
-    <!-- Elo + stats -->
-    <div class="card">
-      <h3>AI Performance</h3>
-      <div class="stats-grid">
-        <div class="stat">
-          <div class="value" id="elo-value">—</div>
-          <div class="label">Elo</div>
+    <!-- Board + eval bar -->
+    <div class="board-col">
+      <div id="board"></div>
+      <div class="eval-bar-wrap">
+        <div class="eval-bar-white" id="eval-bar"></div>
+      </div>
+      <div class="eval-label">
+        <span>Black</span>
+        <span id="eval-text">0.00</span>
+        <span>White</span>
+      </div>
+    </div>
+
+    <!-- Sidebar -->
+    <div class="sidebar">
+
+      <div class="card">
+        <h3>AI Performance</h3>
+        <div class="stats-grid">
+          <div class="stat">
+            <div class="value" id="elo-value">—</div>
+            <div class="label">Elo</div>
+          </div>
+          <div class="stat">
+            <div class="value" id="total-games">—</div>
+            <div class="label">Total Games</div>
+          </div>
         </div>
-        <div class="stat">
-          <div class="value" id="total-games">—</div>
-          <div class="label">Total Games</div>
+      </div>
+
+      <div class="card">
+        <h3>vs Humans</h3>
+        <div class="record">
+          <div>
+            <div class="val win-val"  id="h-wins">0</div>
+            <div class="lbl">You Won</div>
+          </div>
+          <div>
+            <div class="val draw-val" id="h-draws">0</div>
+            <div class="lbl">Draws</div>
+          </div>
+          <div>
+            <div class="val loss-val" id="h-losses">0</div>
+            <div class="lbl">AI Won</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Status</h3>
+        <div id="status">Press New Game to play.</div>
+      </div>
+
+      <div class="card">
+        <h3>AI considers</h3>
+        <div id="pv-line">—</div>
+      </div>
+
+      <div class="card">
+        <h3>Move History</h3>
+        <div id="move-list"></div>
+      </div>
+
+      <div class="card">
+        <h3>Controls</h3>
+        <div class="diff-row">
+          <label>Difficulty</label>
+          <input type="range" id="diff-slider" min="0" max="3" step="1" value="1">
+          <span id="diff-label">Medium</span>
+        </div>
+        <button id="btn-new">New Game</button>
+        <button id="btn-pgn">Download PGN</button>
+      </div>
+
+      <div class="selfplay-row">
+        <div class="dot" id="sp-dot"></div>
+        <span id="sp-label">Self-play: —</span>
+      </div>
+
+    </div><!-- /sidebar -->
+  </div>
+</div>
+
+<!-- ══ SELF-PLAY TAB ═════════════════════════════════════════════════ -->
+<div id="tab-live" class="tab-content">
+  <div class="container" style="flex-direction:column; align-items:center;">
+    <div id="live-board"></div>
+    <div id="live-info">Waiting for self-play…</div>
+    <div id="live-move-counter"></div>
+  </div>
+</div>
+
+<!-- ══ STATS TAB ═════════════════════════════════════════════════════ -->
+<div id="tab-stats" class="tab-content">
+  <div class="stats-tab-container">
+
+    <div class="chart-card">
+      <h3>Elo Progression</h3>
+      <svg id="elo-chart" viewBox="0 0 700 220" preserveAspectRatio="none">
+        <text x="350" y="120" text-anchor="middle" fill="#333" font-size="13" font-family="monospace">
+          Play games to see Elo progression
+        </text>
+      </svg>
+    </div>
+
+    <div class="chart-card">
+      <h3>Training Stats</h3>
+      <div class="training-grid">
+        <div class="training-stat">
+          <div class="val" id="stat-total">—</div>
+          <div class="lbl">Total Games</div>
+        </div>
+        <div class="training-stat">
+          <div class="val" id="stat-sp">—</div>
+          <div class="lbl">Self-play Games</div>
+        </div>
+        <div class="training-stat">
+          <div class="val" id="stat-buf">—</div>
+          <div class="lbl">Replay Buffer</div>
         </div>
       </div>
     </div>
 
-    <!-- vs Human record -->
-    <div class="card">
-      <h3>vs Humans</h3>
-      <div class="record">
-        <div>
-          <div class="val win-val"  id="h-wins">0</div>
-          <div class="lbl">You Won</div>
-        </div>
-        <div>
-          <div class="val draw-val" id="h-draws">0</div>
-          <div class="lbl">Draws</div>
-        </div>
-        <div>
-          <div class="val loss-val" id="h-losses">0</div>
-          <div class="lbl">AI Won</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Game status -->
-    <div class="card">
-      <h3>Status</h3>
-      <div id="status">Press New Game to play.</div>
-    </div>
-
-    <!-- Move history -->
-    <div class="card">
-      <h3>Move History</h3>
-      <div id="move-list"></div>
-    </div>
-
-    <!-- Controls -->
-    <div class="card">
-      <h3>Controls</h3>
-      <button id="btn-new">New Game</button>
-    </div>
-
-    <!-- Self-play indicator -->
-    <div class="selfplay-row">
-      <div class="dot" id="sp-dot"></div>
-      <span id="sp-label">Self-play: —</span>
-    </div>
-
-  </div><!-- /sidebar -->
-</div><!-- /container -->
+  </div>
+</div>
 
 
 <!-- JS Libraries -->
 <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
 <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
-<!-- chess.js for local move validation -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
 
 <script>
-  // ── Local chess.js mirror ─────────────────────────────────────────
-  let game    = new Chess();
-  let board   = null;
-  let busy    = false;   // prevents moves while AI is thinking or game is over
-  let active  = false;   // whether a game is in progress
+// ── Tab switching ─────────────────────────────────────────────────
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+    if (btn.dataset.tab === 'stats') refreshEloChart();
+  });
+});
 
-  // ── Board initialisation ──────────────────────────────────────────
-  function initBoard() {
-    board = Chessboard('board', {
-      draggable:   true,
-      position:    'start',
-      orientation: 'white',
-      pieceTheme:  'https://lichess1.org/assets/piece/cburnett/{piece}.svg',
-      onDragStart: onDragStart,
-      onDrop:      onDrop,
-      onSnapEnd:   () => board.position(game.fen()),
-    });
-  }
+// ── Difficulty slider ─────────────────────────────────────────────
+const DIFF_SIMS   = [5, 25, 100, 400];
+const DIFF_LABELS = ['Beginner', 'Easy', 'Medium', 'Hard'];
+const diffSlider  = document.getElementById('diff-slider');
+const diffLabel   = document.getElementById('diff-label');
+diffSlider.addEventListener('input', () => {
+  diffLabel.textContent = DIFF_LABELS[+diffSlider.value];
+});
 
-  function onDragStart(source, piece) {
-    if (!active || busy || game.game_over()) return false;
-    if (game.turn() !== 'w') return false;      // only white's pieces
-    if (piece.startsWith('b')) return false;
-    return true;
-  }
+// ── Local chess.js mirror ─────────────────────────────────────────
+let game   = new Chess();
+let board  = null;
+let busy   = false;
+let active = false;
 
-  async function onDrop(source, target) {
-    if (busy || !active) return 'snapback';
+function initBoard() {
+  board = Chessboard('board', {
+    draggable:   true,
+    position:    'start',
+    orientation: 'white',
+    pieceTheme:  'https://lichess1.org/assets/piece/cburnett/{piece}.svg',
+    onDragStart: onDragStart,
+    onDrop:      onDrop,
+    onSnapEnd:   () => board.position(game.fen()),
+  });
+}
 
-    // Auto-promote to queen
-    const uci = source + target;
-    const move = game.move({ from: source, to: target, promotion: 'q' });
-    if (!move) return 'snapback';
+function onDragStart(source, piece) {
+  if (!active || busy || game.game_over()) return false;
+  if (game.turn() !== 'w') return false;
+  if (piece.startsWith('b')) return false;
+  return true;
+}
 
-    busy = true;
-    setStatus('Sending move…');
+async function onDrop(source, target) {
+  if (busy || !active) return 'snapback';
 
-    try {
-      // 1. Send human move
-      const uciStr = move.from + move.to + (move.promotion || '');
-      const resp = await api('POST', '/api/move', { move: uciStr });
+  const move = game.move({ from: source, to: target, promotion: 'q' });
+  if (!move) return 'snapback';
 
-      if (resp.status === 'game_over') {
-        board.position(resp.fen);
-        handleGameOver(resp.outcome);
-        return;
-      }
+  busy = true;
+  setStatus('Sending move…');
+  updateEvalBar(null);
 
-      // 2. Request AI move
-      const gpuNote = (await api('GET', '/api/stats')).device === 'cpu'
-        ? ' (~10s on CPU)' : '';
-      setStatus(`AI thinking…${gpuNote}`, 'thinking');
-      const aiResp = await api('GET', '/api/ai-move');
+  try {
+    const uciStr = move.from + move.to + (move.promotion || '');
+    const resp   = await api('POST', '/api/move', { move: uciStr });
 
-      // Update local chess.js state
-      const aiFrom = aiResp.move.slice(0, 2);
-      const aiTo   = aiResp.move.slice(2, 4);
-      const aiProm = aiResp.move.length > 4 ? aiResp.move[4] : 'q';
-      game.move({ from: aiFrom, to: aiTo, promotion: aiProm });
-      board.position(game.fen());
-
-      updateMoveHistory();
-
-      if (aiResp.status === 'game_over') {
-        handleGameOver(aiResp.outcome);
-      } else {
-        setStatus('Your turn (White)');
-      }
-    } catch (err) {
-      console.error(err);
-      setStatus('Error — see console');
-    } finally {
-      busy = false;
+    if (resp.status === 'game_over') {
+      board.position(resp.fen);
+      handleGameOver(resp.outcome);
+      return;
     }
-  }
 
-  function handleGameOver(outcome) {
-    active = false;
-    if (outcome === 'white') {
-      setStatus('You win! 🎉', 'win');
-    } else if (outcome === 'black') {
-      setStatus('AI wins.', 'lose');
+    // Request AI move
+    const stats   = await api('GET', '/api/stats');
+    const gpuNote = stats.device === 'cpu' ? ' (~slow on CPU)' : '';
+    setStatus(`AI thinking…${gpuNote}`, 'thinking');
+
+    const aiResp = await api('GET', '/api/ai-move');
+
+    const aiFrom = aiResp.move.slice(0, 2);
+    const aiTo   = aiResp.move.slice(2, 4);
+    const aiProm = aiResp.move.length > 4 ? aiResp.move[4] : 'q';
+    game.move({ from: aiFrom, to: aiTo, promotion: aiProm });
+    board.position(game.fen());
+
+    updateMoveHistory();
+    updatePV(aiResp.pv || []);
+    refreshEval();
+
+    if (aiResp.status === 'game_over') {
+      handleGameOver(aiResp.outcome);
     } else {
-      setStatus('Draw.', 'draw');
+      setStatus('Your turn (White)');
     }
-    refreshStats();
+  } catch (err) {
+    console.error(err);
+    setStatus('Error — see console');
+  } finally {
+    busy = false;
+  }
+}
+
+function handleGameOver(outcome) {
+  active = false;
+  if (outcome === 'white')      setStatus('You win!', 'win');
+  else if (outcome === 'black') setStatus('AI wins.', 'lose');
+  else                          setStatus('Draw.',    'draw');
+  refreshStats();
+}
+
+// ── New game ───────────────────────────────────────────────────────
+document.getElementById('btn-new').addEventListener('click', async () => {
+  if (busy) return;
+  busy = true;
+  try {
+    const sims = DIFF_SIMS[+diffSlider.value];
+    await api('POST', `/api/new-game?sims=${sims}`);
+    game.reset();
+    board.start();
+    active = true;
+    document.getElementById('move-list').innerHTML = '';
+    updatePV([]);
+    updateEvalBar(0);
+    setStatus('Your turn (White)');
+  } catch (err) {
+    console.error(err);
+    setStatus('Failed to start game');
+  } finally {
+    busy = false;
+  }
+});
+
+// ── PGN download ───────────────────────────────────────────────────
+document.getElementById('btn-pgn').addEventListener('click', async () => {
+  try {
+    const { pgn } = await api('GET', '/api/pgn');
+    const blob = new Blob([pgn], { type: 'text/plain' });
+    const a    = document.createElement('a');
+    a.href     = URL.createObjectURL(blob);
+    a.download = 'game.pgn';
+    a.click();
+  } catch (err) {
+    console.error(err);
+  }
+});
+
+// ── Move history ───────────────────────────────────────────────────
+function updateMoveHistory() {
+  const history = game.history();
+  const el      = document.getElementById('move-list');
+  let html = '';
+  for (let i = 0; i < history.length; i += 2) {
+    const n = Math.floor(i / 2) + 1;
+    const w = `<span class="white">${history[i]}</span>`;
+    const b = history[i + 1] ? ` <span class="black">${history[i + 1]}</span>` : '';
+    html += `<div>${n}. ${w}${b}</div>`;
+  }
+  el.innerHTML = html;
+  el.scrollTop = el.scrollHeight;
+}
+
+// ── PV display ────────────────────────────────────────────────────
+function updatePV(pv) {
+  document.getElementById('pv-line').textContent = pv.length ? pv.join(' ') : '—';
+}
+
+// ── Eval bar ─────────────────────────────────────────────────────
+async function refreshEval() {
+  try {
+    const { eval: ev } = await api('GET', '/api/eval');
+    updateEvalBar(ev);
+  } catch (_) {}
+}
+
+function updateEvalBar(value) {
+  const bar   = document.getElementById('eval-bar');
+  const label = document.getElementById('eval-text');
+  if (value === null) {
+    bar.style.width = '50%';
+    label.textContent = '…';
+    return;
+  }
+  // value in [-1,1] from White's perspective → bar width 0%–100%
+  const pct = ((value + 1) / 2 * 100).toFixed(1);
+  bar.style.width = pct + '%';
+  label.textContent = (value >= 0 ? '+' : '') + value.toFixed(2);
+}
+
+// ── Status helper ─────────────────────────────────────────────────
+function setStatus(msg, cls = '') {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className   = cls;
+}
+
+// ── API helper ────────────────────────────────────────────────────
+async function api(method, path, body) {
+  const opts = { method, headers: {} };
+  if (body) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(path, opts);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || res.statusText);
+  }
+  return res.json();
+}
+
+// ── Stats polling ─────────────────────────────────────────────────
+async function refreshStats() {
+  try {
+    const s = await api('GET', '/api/stats');
+    document.getElementById('elo-value').textContent   = s.ai_elo;
+    document.getElementById('total-games').textContent = s.total_games.toLocaleString();
+    document.getElementById('h-wins').textContent      = s.human_wins;
+    document.getElementById('h-draws').textContent     = s.human_draws;
+    document.getElementById('h-losses').textContent    = s.human_losses;
+
+    document.getElementById('stat-total').textContent  = s.total_games.toLocaleString();
+    document.getElementById('stat-sp').textContent     = s.selfplay_games.toLocaleString();
+    document.getElementById('stat-buf').textContent    = s.replay_buffer.toLocaleString();
+
+    const selfplaying       = !s.human_game_active;
+    const dot               = document.getElementById('sp-dot');
+    const label             = document.getElementById('sp-label');
+    dot.className           = 'dot' + (selfplaying ? ' active' : '');
+    label.textContent       = `Self-play: ${s.selfplay_games.toLocaleString()} games  buf=${s.replay_buffer.toLocaleString()}`;
+  } catch (_) {}
+}
+
+// ── Elo chart ─────────────────────────────────────────────────────
+async function refreshEloChart() {
+  try {
+    const { history } = await api('GET', '/api/elo-history');
+    drawEloChart(history);
+  } catch (_) {}
+}
+
+function drawEloChart(history) {
+  const svg = document.getElementById('elo-chart');
+  if (!history || history.length < 2) {
+    svg.innerHTML = `<text x="350" y="120" text-anchor="middle" fill="#333"
+      font-size="13" font-family="monospace">Play games to see Elo progression</text>`;
+    return;
   }
 
-  // ── New game ───────────────────────────────────────────────────────
-  document.getElementById('btn-new').addEventListener('click', async () => {
-    if (busy) return;
-    busy = true;
-    try {
-      await api('POST', '/api/new-game');
-      game.reset();
-      board.start();
-      active = true;
-      document.getElementById('move-list').innerHTML = '';
-      setStatus('Your turn (White)');
-    } catch (err) {
-      console.error(err);
-      setStatus('Failed to start game');
-    } finally {
-      busy = false;
-    }
+  const W = 700, H = 220, PL = 55, PR = 15, PT = 15, PB = 35;
+  const gW = W - PL - PR, gH = H - PT - PB;
+
+  const games = history.map(h => h[0]);
+  const elos  = history.map(h => h[1]);
+  const minG  = games[0],  maxG = games[games.length - 1];
+  const minE  = Math.min(...elos) - 30;
+  const maxE  = Math.max(...elos) + 30;
+
+  const xS = g => PL + (maxG === minG ? gW / 2 : (g - minG) / (maxG - minG) * gW);
+  const yS = e => PT + gH - (e - minE) / (maxE - minE) * gH;
+
+  // Grid lines
+  const eStep  = Math.ceil((maxE - minE) / 5 / 50) * 50;
+  let gridLines = '';
+  for (let e = Math.ceil(minE / eStep) * eStep; e <= maxE; e += eStep) {
+    const y = yS(e).toFixed(1);
+    gridLines += `<line x1="${PL}" y1="${y}" x2="${W - PR}" y2="${y}" stroke="#1a1a1a" stroke-width="1"/>`;
+    gridLines += `<text x="${PL - 6}" y="${y}" text-anchor="end" fill="#444" font-size="10" font-family="monospace" dominant-baseline="middle">${e}</text>`;
+  }
+
+  // Polyline
+  const pts = history.map(([g, e]) => `${xS(g).toFixed(1)},${yS(e).toFixed(1)}`).join(' ');
+
+  // X-axis labels
+  let xLabels = '';
+  const step  = Math.max(1, Math.floor(history.length / 5));
+  for (let i = 0; i < history.length; i += step) {
+    const x = xS(history[i][0]).toFixed(1);
+    xLabels += `<text x="${x}" y="${H - PB + 16}" text-anchor="middle" fill="#444" font-size="10" font-family="monospace">${history[i][0]}</text>`;
+  }
+
+  // Current Elo dot
+  const lastX = xS(games[games.length - 1]).toFixed(1);
+  const lastY = yS(elos[elos.length - 1]).toFixed(1);
+
+  svg.innerHTML = `
+    ${gridLines}
+    <line x1="${PL}" y1="${PT}" x2="${PL}" y2="${H - PB}" stroke="#222" stroke-width="1"/>
+    <line x1="${PL}" y1="${H - PB}" x2="${W - PR}" y2="${H - PB}" stroke="#222" stroke-width="1"/>
+    <polyline points="${pts}" fill="none" stroke="#4caf50" stroke-width="2" stroke-linejoin="round"/>
+    <circle cx="${lastX}" cy="${lastY}" r="4" fill="#4caf50"/>
+    <text x="${+lastX + 8}" y="${lastY}" fill="#4caf50" font-size="11" font-family="monospace"
+      dominant-baseline="middle">${elos[elos.length - 1]}</text>
+    ${xLabels}
+    <text x="${PL + gW / 2}" y="${H}" text-anchor="middle" fill="#333" font-size="10" font-family="monospace">Games</text>
+  `;
+}
+
+// ── Live self-play SSE ────────────────────────────────────────────
+let liveBoard = null;
+
+function initLiveBoard() {
+  liveBoard = Chessboard('live-board', {
+    draggable:  false,
+    position:   'start',
+    pieceTheme: 'https://lichess1.org/assets/piece/cburnett/{piece}.svg',
   });
 
-  // ── Move history ───────────────────────────────────────────────────
-  function updateMoveHistory() {
-    const history = game.history();
-    const el = document.getElementById('move-list');
-    let html = '';
-    for (let i = 0; i < history.length; i += 2) {
-      const n = Math.floor(i / 2) + 1;
-      const w = `<span class="white">${history[i]}</span>`;
-      const b = history[i + 1]
-        ? ` <span class="black">${history[i + 1]}</span>`
-        : '';
-      html += `<div>${n}. ${w}${b}</div>`;
-    }
-    el.innerHTML = html;
-    el.scrollTop = el.scrollHeight;
-  }
+  const evtSource = new EventSource('/api/selfplay-stream');
+  evtSource.onmessage = e => {
+    const data = JSON.parse(e.data);
+    liveBoard.position(data.fen, false);
+    document.getElementById('live-info').textContent =
+      `Game #${(data.game + 1).toLocaleString()}  —  Move ${data.move_n}: ${data.move}`;
+  };
+  evtSource.onerror = () => {
+    document.getElementById('live-info').textContent = 'Stream disconnected — refresh to reconnect';
+  };
+}
 
-  // ── Status helper ──────────────────────────────────────────────────
-  function setStatus(msg, cls = '') {
-    const el = document.getElementById('status');
-    el.textContent  = msg;
-    el.className    = cls;
-  }
-
-  // ── API helper ─────────────────────────────────────────────────────
-  async function api(method, path, body) {
-    const opts = { method, headers: {} };
-    if (body) {
-      opts.headers['Content-Type'] = 'application/json';
-      opts.body = JSON.stringify(body);
-    }
-    const res = await fetch(path, opts);
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new Error(err.detail || res.statusText);
-    }
-    return res.json();
-  }
-
-  // ── Stats polling ─────────────────────────────────────────────────
-  async function refreshStats() {
-    try {
-      const s = await api('GET', '/api/stats');
-      document.getElementById('elo-value').textContent   = s.ai_elo;
-      document.getElementById('total-games').textContent = s.total_games.toLocaleString();
-      document.getElementById('h-wins').textContent      = s.human_wins;
-      document.getElementById('h-draws').textContent     = s.human_draws;
-      document.getElementById('h-losses').textContent    = s.human_losses;
-
-      // Self-play indicator
-      const dot   = document.getElementById('sp-dot');
-      const label = document.getElementById('sp-label');
-      const selfplaying = !s.human_game_active;
-      dot.className   = 'dot' + (selfplaying ? ' active' : '');
-      label.textContent = `Self-play: ${s.selfplay_games.toLocaleString()} games  ε=${s.epsilon}`;
-    } catch (_) { /* ignore — server might be starting up */ }
-  }
-
-  // ── Boot ───────────────────────────────────────────────────────────
-  initBoard();
-  refreshStats();
-  setInterval(refreshStats, 4000);
+// ── Boot ──────────────────────────────────────────────────────────
+initBoard();
+initLiveBoard();
+refreshStats();
+refreshEloChart();
+setInterval(refreshStats, 5000);
 </script>
 </body>
 </html>

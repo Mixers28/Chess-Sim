@@ -4,8 +4,9 @@ app.py — Chess AlphaZero Web Server
 FastAPI server that:
   • Serves a chess web UI for humans to play against the AI
   • Runs background self-play (MCTS) in a daemon thread
+  • Broadcasts live self-play positions via SSE
   • Learns from human games (stores training samples + gradient updates)
-  • Tracks Elo rating
+  • Tracks Elo rating and progression history
   • Persists all knowledge via checkpoints
 
 Run:
@@ -13,7 +14,9 @@ Run:
 Then open http://localhost:8000
 """
 
+import asyncio
 import atexit
+import json
 import os
 import random
 import threading
@@ -21,30 +24,33 @@ import time
 from contextlib import asynccontextmanager
 
 import chess
+import chess.pgn
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import chess_model as M
 from chess_model import load_checkpoint, save_checkpoint
-from chess_env import encode, idx_to_move, legal_mask
+from chess_env import encode, idx_to_move, legal_mask, mirror_sample
 from chess_mcts import MCTS
 from chess_wargames import az_update, selfplay_game
 
 STATIC_DIR      = os.path.join(os.path.dirname(__file__), "static")
 MCTS_SIMS_SP    = 100   # simulations per move during self-play
-# Human game: fewer sims for playable response time
-# CPU: ~1.2s/sim → 10 sims ≈ 12s/move, 50 sims ≈ 60s/move
-# GPU: ~0.05s/sim → 50 sims ≈ 2.5s/move
 import torch as _t
 MCTS_SIMS_HUMAN = 50 if _t.cuda.is_available() else 10
 TRAIN_STEPS     = 5     # gradient steps after each game
 SAVE_EVERY_SP   = 50    # self-play games between saves
 SAVE_EVERY_HU   = 10    # human games between saves
 MAX_MOVES       = 150
+
+
+# ── Live self-play state (for SSE stream) ─────────────────────────────
+_sp_state: dict = {}
+_sp_lock        = threading.Lock()
 
 
 # ── Human game state ──────────────────────────────────────────────────
@@ -57,8 +63,10 @@ class HumanGame:
         self.active       = False
         self.move_history = []
         self.outcome      = None
-        self.traj_w       = []    # (state, policy, color) for white (human)
-        self.traj_b       = []    # (state, policy, color) for black (AI)
+        self.traj_w       = []    # (state, policy) for white (human)
+        self.traj_b       = []    # (state, policy) for black (AI)
+        self.mcts_root    = None  # reuse MCTS tree between moves
+        self.n_sims       = MCTS_SIMS_HUMAN  # difficulty (sims per move)
 
 
 current_game = HumanGame()
@@ -82,17 +90,18 @@ def _finalize_human_game():
     current_game.outcome = result
 
     # Build training samples from human game trajectories
-    final_enc = encode(board)
     dummy_policy = np.zeros(4096, dtype=np.float32)
 
     for traj, reward in [(current_game.traj_w, w_r), (current_game.traj_b, b_r)]:
         for state, policy in traj:
-            M.replay_buf.push(state, policy if policy is not None else dummy_policy, reward)
+            p = policy if policy is not None else dummy_policy
+            M.replay_buf.push(state, p, reward)
+            M.replay_buf.push(*mirror_sample(state, p, reward))
 
     # Gradient update
     with M.model_lock:
         for _ in range(TRAIN_STEPS):
-            az_update(M.policy_net, M.replay_buf, M.optimizer)
+            az_update(M.policy_net, M.replay_buf, M.optimizer, M.scheduler)
 
     # Elo + stats
     M.ai_elo       = M.update_elo(M.ai_elo, M.ELO_DEFAULT_HUMAN, ai_score)
@@ -105,6 +114,7 @@ def _finalize_human_game():
     else:
         M.human_draws  += 1
 
+    M.record_elo()
     M.human_game_active.clear()
 
     if M.human_games % SAVE_EVERY_HU == 0:
@@ -122,14 +132,26 @@ def selfplay_loop():
             continue
 
         M.policy_net.eval()
-        samples, _, _ = selfplay_game(board, mcts)
+
+        # Broadcast each move to live SSE stream
+        def _broadcast(fen, move_uci, move_n):
+            with _sp_lock:
+                _sp_state.update({
+                    "fen":    fen,
+                    "move":   move_uci,
+                    "game":   M.selfplay_games,
+                    "move_n": move_n,
+                })
+
+        samples, _, _ = selfplay_game(board, mcts, position_cb=_broadcast)
 
         for state, policy, value in samples:
             M.replay_buf.push(state, policy, value)
+            M.replay_buf.push(*mirror_sample(state, policy, value))
 
         with M.model_lock:
             for _ in range(TRAIN_STEPS):
-                az_update(M.policy_net, M.replay_buf, M.optimizer)
+                az_update(M.policy_net, M.replay_buf, M.optimizer, M.scheduler)
 
         M.total_games    += 1
         M.selfplay_games += 1
@@ -151,7 +173,7 @@ async def lifespan(app: FastAPI):
     sp.start()
 
     dev_str = str(M.device).upper()
-    print(f"[app] AlphaZero | {M.AZ_RES_BLOCKS} res blocks | "
+    print(f"[app] AlphaZero+SE | {M.AZ_RES_BLOCKS} res blocks | "
           f"{M.AZ_CHANNELS} channels | {M.n_params:,} params | Device: {dev_str}")
     if M.device.type == "cpu":
         print("[app] ⚠  GPU strongly recommended — self-play will be slow on CPU")
@@ -204,13 +226,87 @@ async def get_stats():
     }
 
 
+@app.get("/api/elo-history")
+async def get_elo_history():
+    return {"history": M.elo_history}
+
+
+@app.get("/api/eval")
+async def get_eval():
+    """Run the value head on the current position. Returns eval from White's perspective."""
+    with game_lock:
+        board_copy = current_game.board.copy(stack=False)
+
+    state_t = torch.tensor(encode(board_copy), dtype=torch.float32) \
+                   .unsqueeze(0).to(M.device)
+    with torch.no_grad(), M.model_lock:
+        _, value_t = M.policy_net(state_t)
+
+    value = value_t.item()
+    # value head is from current player's perspective; convert to White's perspective
+    if board_copy.turn == chess.BLACK:
+        value = -value
+
+    return {"eval": round(value, 3), "turn": "white" if board_copy.turn == chess.WHITE else "black"}
+
+
+@app.get("/api/pgn")
+async def get_pgn():
+    """Return the current game as a PGN string."""
+    with game_lock:
+        move_history = list(current_game.move_history)
+        outcome      = current_game.outcome
+
+    pgn_game = chess.pgn.Game()
+    pgn_game.headers["Event"]  = "WARGAMES"
+    pgn_game.headers["White"]  = "Human"
+    pgn_game.headers["Black"]  = f"AlphaZero (Elo {round(M.ai_elo)})"
+    pgn_game.headers["Result"] = (
+        "1-0" if outcome == "white" else
+        "0-1" if outcome == "black" else
+        "1/2-1/2" if outcome == "draw" else "*"
+    )
+
+    board = chess.Board()
+    node  = pgn_game
+    for uci in move_history:
+        mv   = chess.Move.from_uci(uci)
+        node = node.add_variation(mv)
+        board.push(mv)
+
+    return {"pgn": str(pgn_game)}
+
+
+@app.get("/api/selfplay-stream")
+async def selfplay_stream():
+    """SSE endpoint: streams live self-play board positions as they happen."""
+    async def generate():
+        last_key = None
+        while True:
+            with _sp_lock:
+                state = dict(_sp_state)
+            key = (state.get("game"), state.get("move_n"))
+            if state and key != last_key:
+                last_key = key
+                yield f"data: {json.dumps(state)}\n\n"
+            await asyncio.sleep(0.25)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.post("/api/new-game")
-async def new_game():
+async def new_game(sims: int = Query(default=None)):
     with game_lock:
         current_game.reset()
         current_game.active = True
+        if sims is not None:
+            current_game.n_sims = max(5, min(sims, 800))
     M.human_game_active.set()
-    return {"status": "ok", "fen": chess.Board().fen()}
+    return {"status": "ok", "fen": chess.Board().fen(), "n_sims": current_game.n_sims}
 
 
 class MoveRequest(BaseModel):
@@ -239,11 +335,16 @@ async def human_move(req: MoveRequest):
                 raise HTTPException(400, f"Illegal move: {req.move}")
             mv = mv_q
 
-        # Record for learning (use uniform policy for human moves)
-        state = encode(current_game.board)
-        mask  = legal_mask(current_game.board)
+        # Record for learning (uniform policy for human moves)
+        state  = encode(current_game.board)
+        mask   = legal_mask(current_game.board)
         policy = mask / max(mask.sum(), 1.0)
         current_game.traj_w.append((state, policy))
+
+        # Advance MCTS tree to match human's move
+        if current_game.mcts_root is not None:
+            a_human = mv.from_square * 64 + mv.to_square
+            current_game.mcts_root = current_game.mcts_root.children.get(a_human)
 
         current_game.board.push(mv)
         current_game.move_history.append(mv.uci())
@@ -258,7 +359,7 @@ async def human_move(req: MoveRequest):
 
 @app.get("/api/ai-move")
 async def ai_move():
-    """AI (black) calculates and plays its move using MCTS."""
+    """AI (black) calculates and plays its move using MCTS with tree reuse."""
     with game_lock:
         if not current_game.active:
             raise HTTPException(400, "No active game.")
@@ -266,35 +367,52 @@ async def ai_move():
             raise HTTPException(400, "Not AI's turn.")
         if current_game.outcome is not None:
             raise HTTPException(400, "Game is already over.")
+        board_snapshot = current_game.board.copy(stack=True)
+        state          = encode(board_snapshot)
+        n_sims         = current_game.n_sims
+        prev_root      = current_game.mcts_root
 
-        board = current_game.board
-        state = encode(board)
+    # Run MCTS outside the lock (slow path) — reuse tree if available
+    mcts = MCTS(M.policy_net, M.device, n_sims=n_sims)
+    with M.model_lock:
+        M.policy_net.eval()
+        action, counts, new_root = mcts.get_policy(
+            board_snapshot, temperature=0, root=prev_root
+        )
 
-        # Run MCTS (greedy — temperature=0)
-        mcts = MCTS(M.policy_net, M.device, n_sims=MCTS_SIMS_HUMAN)
-        with M.model_lock:
-            M.policy_net.eval()
-            action, counts = mcts.get_policy(board, temperature=0)
+    pv = mcts.get_pv(new_root, board_snapshot)
 
-        mv = idx_to_move(action, board)
-        if mv is None:
-            mv     = random.choice(list(board.legal_moves))
-            action = mv.from_square * 64 + mv.to_square
+    mv = idx_to_move(action, board_snapshot)
+    if mv is None:
+        mv     = random.choice(list(board_snapshot.legal_moves))
+        action = mv.from_square * 64 + mv.to_square
 
-        # Record trajectory
-        total = counts.sum()
-        policy = counts / total if total > 0 else counts
+    total  = counts.sum()
+    policy = counts / total if total > 0 else counts
+
+    # Re-acquire lock to push move and update game state
+    with game_lock:
+        if not current_game.active or current_game.outcome is not None:
+            raise HTTPException(400, "Game state changed during AI thinking.")
+        if mv not in current_game.board.legal_moves:
+            raise HTTPException(500, "AI selected an illegal move.")
+
         current_game.traj_b.append((state, policy))
 
-        board.push(mv)
+        # Store the subtree under AI's chosen move for next search
+        current_game.mcts_root = new_root.children.get(action)
+
+        current_game.board.push(mv)
         current_game.move_history.append(mv.uci())
 
-        if board.is_game_over():
+        if current_game.board.is_game_over():
             _finalize_human_game()
             return {"move": mv.uci(), "status": "game_over",
-                    "outcome": current_game.outcome, "fen": board.fen()}
+                    "outcome": current_game.outcome,
+                    "fen": current_game.board.fen(), "pv": pv}
 
-        return {"move": mv.uci(), "status": "ok", "fen": board.fen()}
+        return {"move": mv.uci(), "status": "ok",
+                "fen": current_game.board.fen(), "pv": pv}
 
 
 # ── Entry point ───────────────────────────────────────────────────────
