@@ -348,6 +348,7 @@
           <span id="diff-label">Medium</span>
         </div>
         <button id="btn-new">New Game</button>
+        <button id="btn-resign">Resign</button>
         <button id="btn-pgn">Download PGN</button>
       </div>
 
@@ -482,11 +483,20 @@ async function onDrop(source, target) {
 
     const aiResp = await api('GET', '/api/ai-move');
 
-    const aiFrom = aiResp.move.slice(0, 2);
-    const aiTo   = aiResp.move.slice(2, 4);
-    const aiProm = aiResp.move.length > 4 ? aiResp.move[4] : 'q';
-    game.move({ from: aiFrom, to: aiTo, promotion: aiProm });
-    board.position(game.fen());
+    if (aiResp.status === 'resigned') {
+      setStatus('Game ended.', 'draw');
+      active = false;
+      refreshStats();
+      return;
+    }
+
+    if (aiResp.move) {
+      const aiFrom = aiResp.move.slice(0, 2);
+      const aiTo   = aiResp.move.slice(2, 4);
+      const aiProm = aiResp.move.length > 4 ? aiResp.move[4] : 'q';
+      game.move({ from: aiFrom, to: aiTo, promotion: aiProm });
+      board.position(game.fen());
+    }
 
     updateMoveHistory();
     updatePV(aiResp.pv || []);
@@ -532,6 +542,20 @@ document.getElementById('btn-new').addEventListener('click', async () => {
     setStatus('Failed to start game');
   } finally {
     busy = false;
+  }
+});
+
+// ── Resign ─────────────────────────────────────────────────────────
+document.getElementById('btn-resign').addEventListener('click', async () => {
+  if (!active) return;
+  try {
+    await api('POST', '/api/resign');
+    active = false;
+    busy   = false;
+    setStatus('Game resigned.', 'draw');
+    refreshStats();
+  } catch (err) {
+    console.error(err);
   }
 });
 

@@ -131,10 +131,6 @@ def selfplay_loop():
     mcts  = MCTS(M.policy_net, M.device, n_sims=MCTS_SIMS_SP)
 
     while not M.shutdown_flag:
-        if M.human_game_active.is_set():
-            time.sleep(0.1)
-            continue
-
         try:
             M.policy_net.eval()
 
@@ -337,6 +333,18 @@ async def new_game(sims: int = Query(default=None)):
     return {"status": "ok", "fen": chess.Board().fen(), "n_sims": current_game.n_sims}
 
 
+@app.post("/api/resign")
+async def resign():
+    """Cleanly terminate the current game without affecting Elo or training."""
+    with game_lock:
+        if not current_game.active:
+            raise HTTPException(400, "No active game.")
+        current_game.active  = False
+        current_game.outcome = "resigned"
+    M.human_game_active.clear()
+    return {"status": "ok", "outcome": "resigned"}
+
+
 class MoveRequest(BaseModel):
     move: str
 
@@ -433,7 +441,8 @@ async def ai_move():
     # Re-acquire lock to push move and update game state
     with game_lock:
         if not current_game.active or current_game.outcome is not None:
-            raise HTTPException(400, "Game state changed during AI thinking.")
+            return {"move": None, "status": "resigned", "outcome": current_game.outcome,
+                    "fen": current_game.board.fen(), "pv": []}
         if mv not in current_game.board.legal_moves:
             raise HTTPException(500, "AI selected an illegal move.")
 
