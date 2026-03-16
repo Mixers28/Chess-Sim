@@ -472,6 +472,7 @@ async function onDrop(source, target) {
 
     if (resp.status === 'game_over') {
       board.position(resp.fen);
+      updateMoveHistory();
       handleGameOver(resp.outcome);
       return;
     }
@@ -509,7 +510,7 @@ async function onDrop(source, target) {
     }
   } catch (err) {
     console.error(err);
-    setStatus('Error — see console');
+    setStatus(`Error: ${err.message}`, 'lose');
   } finally {
     busy = false;
   }
