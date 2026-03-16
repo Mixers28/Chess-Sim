@@ -414,7 +414,7 @@ async def ai_move():
         with torch.no_grad(), M.model_lock:
             _, val_t = M.policy_net(state_t)
         # val_t is from current player's (black/AI) perspective; claim if not winning
-        if val_t.item() < 0.1:
+        if val_t.item() < -0.5:
             with game_lock:
                 _finalize_human_game()
             return {"move": None, "status": "game_over", "outcome": "draw",
