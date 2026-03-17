@@ -1,6 +1,6 @@
-torch
-fastapi
-uvicorn[standard]
-python-chess
-numpy
-pydantic
+torch==2.10.0
+fastapi==0.135.1
+uvicorn[standard]==0.42.0
+python-chess==1.999
+numpy==2.4.3
+pydantic==2.12.5
