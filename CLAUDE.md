@@ -94,6 +94,15 @@ Uses **batched virtual-loss** parallelism: multiple simulations are run with vir
 | GET | `/api/ai-move` | Request the AI's move |
 | POST | `/api/resign` | Cleanly terminate game (no Elo/training effect) |
 
+### Deployment
+
+A `Dockerfile` is included for containerized deployment (used with Coolify). It installs CPU-only PyTorch to keep image size manageable. The `checkpoint/` directory is bind-mounted in production so model weights persist across container restarts.
+
+```bash
+docker build -t chess-sim .
+docker run -p 8000:8000 -v ./checkpoint:/app/checkpoint chess-sim
+```
+
 ### Unused Files
 
 - `chess_dqn.py`: Early DQN approach, not used in current pipeline.
