@@ -40,8 +40,8 @@ from chess_mcts import MCTS
 from chess_wargames import az_update, selfplay_game
 
 STATIC_DIR      = os.path.join(os.path.dirname(__file__), "static")
-MCTS_SIMS_SP    = 100 if _t.cuda.is_available() else 20   # simulations per move during self-play
 import torch as _t
+MCTS_SIMS_SP    = 100 if _t.cuda.is_available() else 20   # simulations per move during self-play
 MCTS_SIMS_HUMAN = 50 if _t.cuda.is_available() else 3
 TRAIN_STEPS     = 5     # gradient steps after each game
 SAVE_EVERY_SP   = 50    # self-play games between saves
