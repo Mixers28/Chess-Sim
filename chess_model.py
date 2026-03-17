@@ -53,25 +53,31 @@ n_params = sum(p.numel() for p in policy_net.parameters())
 
 # ── AlphaZero replay buffer ───────────────────────────────────────────
 class AZReplayBuffer:
-    """Stores (state, policy_target, value_target) triples."""
+    """Stores (state, policy_target, value_target, concept_labels) tuples."""
 
     def __init__(self, capacity: int = REPLAY_CAPACITY):
         self.buf = deque(maxlen=capacity)
 
     def push(self,
-             state:   np.ndarray,   # (13, 8, 8)
-             policy:  np.ndarray,   # (4096,)  visit-count distribution
-             value:   float):       # ±1 or 0
-        self.buf.append((state, policy, value))
+             state:    np.ndarray,            # (19, 8, 8)
+             policy:   np.ndarray,            # (ACTION_SIZE,) visit-count distribution
+             value:    float,                 # ±1 or 0
+             concepts: np.ndarray | None = None):  # (N_CONCEPTS,) or None for legacy
+        self.buf.append((state, policy, value, concepts))
 
     def sample(self, n: int):
         batch = random.sample(self.buf, n)
-        s, p, v = zip(*batch)
-        return (
-            torch.tensor(np.array(s), dtype=torch.float32).to(device),
-            torch.tensor(np.array(p), dtype=torch.float32).to(device),
-            torch.tensor(v,           dtype=torch.float32).to(device),
-        )
+        s, p, v, c = zip(*batch)
+        states   = torch.tensor(np.array(s), dtype=torch.float32).to(device)
+        policies = torch.tensor(np.array(p), dtype=torch.float32).to(device)
+        values   = torch.tensor(v,           dtype=torch.float32).to(device)
+        # Handle legacy samples that predate concept labels (concepts=None)
+        if c[0] is None:
+            from chess_env import N_CONCEPTS
+            concepts = torch.zeros(len(c), N_CONCEPTS, dtype=torch.float32).to(device)
+        else:
+            concepts = torch.tensor(np.array(c), dtype=torch.float32).to(device)
+        return states, policies, values, concepts
 
     def __len__(self) -> int:
         return len(self.buf)
@@ -150,7 +156,7 @@ def load_checkpoint() -> bool:
         return False
 
     try:
-        policy_net.load_state_dict(ckpt["policy_state_dict"])
+        policy_net.load_state_dict(ckpt["policy_state_dict"], strict=False)
         optimizer.load_state_dict(ckpt["optimizer_state"])
         if "scheduler_state" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler_state"])

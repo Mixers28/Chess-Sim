@@ -23,7 +23,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from chess_env import encode, idx_to_move, legal_mask, ACTION_SIZE
+from chess_env import encode, idx_to_move, legal_mask, ACTION_SIZE, CONCEPT_NAMES
 
 
 class MCTSNode:
@@ -66,7 +66,7 @@ class MCTS:
         """Returns (priors (ACTION_SIZE,), value float) for one board."""
         state_t = torch.tensor(encode(board), dtype=torch.float32) \
                        .unsqueeze(0).to(self.device)
-        policy_logits, value_t = self.net(state_t)
+        policy_logits, value_t, _ = self.net(state_t)
 
         mask   = legal_mask(board)
         priors = F.softmax(policy_logits.squeeze(0), dim=0).cpu().numpy()
@@ -85,7 +85,7 @@ class MCTS:
         """
         states  = np.stack([encode(b) for b in boards]).astype(np.float32)
         state_t = torch.tensor(states, dtype=torch.float32).to(self.device)
-        policy_logits, value_preds = self.net(state_t)
+        policy_logits, value_preds, _ = self.net(state_t)
 
         masks   = np.stack([legal_mask(b) for b in boards])
         priors  = F.softmax(policy_logits, dim=1).cpu().numpy() * masks
@@ -246,3 +246,36 @@ class MCTS:
             node = node.children[best_a]
 
         return pv
+
+    @torch.no_grad()
+    def explain_move(self, root: MCTSNode, board: chess.Board) -> dict:
+        """
+        Return human-readable reasoning for the top MCTS move.
+        Combines the principal variation with concept activations from the network.
+
+        Returns:
+          pv               — list of UCI move strings (principal variation)
+          concepts         — {concept_name: score} dict, scores in [0, 1]
+          dominant_concept — name of the highest-scoring concept
+          reasoning        — one-line natural-language summary
+        """
+        pv      = self.get_pv(root, board)
+        state_t = torch.tensor(encode(board), dtype=torch.float32) \
+                       .unsqueeze(0).to(self.device)
+        _, _, concepts_t = self.net(state_t)
+        vals = concepts_t.squeeze(0).cpu().tolist()
+
+        concept_dict  = {name: round(v, 3) for name, v in zip(CONCEPT_NAMES, vals)}
+        dominant_idx  = max(range(len(vals)), key=lambda i: vals[i])
+        dominant_name = CONCEPT_NAMES[dominant_idx]
+
+        return {
+            "pv":               pv,
+            "concepts":         concept_dict,
+            "dominant_concept": dominant_name,
+            "reasoning": (
+                f"PV: {' '.join(pv) if pv else '(none)'}. "
+                f"Primary factor: {dominant_name.replace('_', ' ')} "
+                f"({vals[dominant_idx]:.2f})."
+            ),
+        }

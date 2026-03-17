@@ -18,11 +18,99 @@ Move encoding (ACTION_SIZE = 8192):
   4096–8191 : knight underpromotions  (4096 + from_square * 64 + to_square)
 """
 
+import math
+
 import chess
 import numpy as np
 
 INPUT_PLANES = 19
 ACTION_SIZE  = 8192   # 4096 standard + 4096 knight underpromotions
+
+N_CONCEPTS = 6
+CONCEPT_NAMES = [
+    "material_balance", "king_safety", "piece_mobility",
+    "pawn_structure",   "space_control", "tactical_threat",
+]
+
+_PIECE_VALUES = {
+    chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
+    chess.ROOK: 5, chess.QUEEN: 9,  chess.KING: 0,
+}
+
+# Extended centre: files C-F × ranks 3-6 (16 squares)
+_EXTENDED_CENTRE = (
+    (chess.BB_RANK_3 | chess.BB_RANK_4 | chess.BB_RANK_5 | chess.BB_RANK_6)
+    & (chess.BB_FILE_C | chess.BB_FILE_D | chess.BB_FILE_E | chess.BB_FILE_F)
+)
+
+
+def compute_concept_labels(board: chess.Board) -> np.ndarray:
+    """
+    Compute 6 transferable strategic concept scores from the board.
+    Returns float32 (6,) with all values in [0, 1], from the side-to-move's perspective.
+
+    Concept → logistics/security analogue:
+      material_balance  → margin_headroom
+      king_safety       → critical_node_risk (inverted)
+      piece_mobility    → route_optionality
+      pawn_structure    → supply_chain_dependency
+      space_control     → network_coverage
+      tactical_threat   → disruption_probability
+    """
+    side = board.turn
+    opp  = not side
+
+    # 1. material_balance — sigmoid of side-to-move's material advantage
+    mat = {chess.WHITE: 0, chess.BLACK: 0}
+    for p in board.piece_map().values():
+        mat[p.color] += _PIECE_VALUES[p.piece_type]
+    adv = mat[side] - mat[opp]
+    material_balance = 1.0 / (1.0 + math.exp(-adv / 3.0))
+
+    # 2. king_safety — fewer attacker vs more pawn shield → safer
+    king_sq = board.king(side)
+    attacker_count = len(board.attackers(opp, king_sq)) if king_sq is not None else 0
+    shield = 0
+    if king_sq is not None:
+        kf, kr = chess.square_file(king_sq), chess.square_rank(king_sq)
+        shield_rank = kr + (1 if side == chess.WHITE else -1)
+        if 0 <= shield_rank <= 7:
+            for f in range(max(0, kf - 1), min(8, kf + 2)):
+                p = board.piece_at(chess.square(f, shield_rank))
+                if p and p.piece_type == chess.PAWN and p.color == side:
+                    shield += 1
+    king_safety = 1.0 / (1.0 + math.exp(attacker_count - shield))
+
+    # 3. piece_mobility — legal move count normalised (40 ≈ typical mean)
+    n_legal = board.legal_moves.count()
+    piece_mobility = min(n_legal / 40.0, 1.0)
+
+    # 4. pawn_structure — penalise doubled and isolated pawns
+    pawns = list(board.pieces(chess.PAWN, side))
+    if pawns:
+        pfiles   = [chess.square_file(sq) for sq in pawns]
+        fset     = set(pfiles)
+        doubled  = sum(1 for f in fset if pfiles.count(f) > 1)
+        isolated = sum(1 for f in fset if (f - 1) not in fset and (f + 1) not in fset)
+        pawn_structure = max(0.0, 1.0 - (doubled + isolated) / (2.0 * len(pawns)))
+    else:
+        pawn_structure = 0.5
+
+    # 5. space_control — fraction of extended centre squares we attack
+    our_attacks = chess.BB_EMPTY
+    for sq in chess.scan_forward(board.occupied_co[side]):
+        our_attacks |= board.attacks_mask(sq)
+    space_control = bin(our_attacks & _EXTENDED_CENTRE).count("1") / 16.0
+
+    # 6. tactical_threat — fraction of legal moves that are captures
+    captures = sum(1 for mv in board.legal_moves if board.is_capture(mv))
+    tactical_threat = captures / max(n_legal, 1)
+
+    return np.array(
+        [material_balance, king_safety, piece_mobility,
+         pawn_structure, space_control, tactical_threat],
+        dtype=np.float32,
+    )
 
 # piece_type (1-indexed) → plane offset
 _PT_OFFSET = {

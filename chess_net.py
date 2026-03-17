@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from chess_env import INPUT_PLANES, ACTION_SIZE
+from chess_env import INPUT_PLANES, ACTION_SIZE, N_CONCEPTS
 
 
 class SEBlock(nn.Module):
@@ -54,6 +54,36 @@ class SEResBlock(nn.Module):
         x = F.relu(self.bn1(self.conv1(x)))
         x = self.se(self.bn2(self.conv2(x)))
         return F.relu(x + residual)
+
+
+class ConceptBottleneck(nn.Module):
+    """
+    Auxiliary head that predicts N_CONCEPTS strategic scores from the residual tower.
+    Supervised by auto-labels from python-chess (see chess_env.compute_concept_labels).
+    Sits between res_tower and policy/value heads; does NOT bottleneck them.
+
+    Concept scores transfer to logistics/security domains:
+      material_balance → margin_headroom
+      king_safety      → critical_node_risk
+      piece_mobility   → route_optionality
+      pawn_structure   → supply_chain_dependency
+      space_control    → network_coverage
+      tactical_threat  → disruption_probability
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc   = nn.Sequential(
+            nn.Linear(channels, 64),
+            nn.ReLU(),
+            nn.Linear(64, N_CONCEPTS),
+            nn.Sigmoid(),   # all concept scores in [0, 1]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, C, 8, 8) → concepts: (B, N_CONCEPTS)"""
+        return self.fc(self.pool(x).flatten(1))
 
 
 class AlphaZeroNet(nn.Module):
@@ -99,9 +129,13 @@ class AlphaZeroNet(nn.Module):
             nn.Tanh(),   # output in [-1, 1]
         )
 
+        # Concept head (auxiliary — does not gate policy/value)
+        self.concept_bottleneck = ConceptBottleneck(channels)
+
     def forward(self, x: torch.Tensor):
-        x = self.input_tower(x)
-        x = self.res_tower(x)
-        policy = self.policy_head(x)           # (B, 4096)
-        value  = self.value_head(x).squeeze(1) # (B,)
-        return policy, value
+        x        = self.input_tower(x)
+        x        = self.res_tower(x)
+        policy   = self.policy_head(x)            # (B, ACTION_SIZE)
+        value    = self.value_head(x).squeeze(1)  # (B,)
+        concepts = self.concept_bottleneck(x)     # (B, N_CONCEPTS)
+        return policy, value, concepts

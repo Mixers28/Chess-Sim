@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 import chess_model as M
 from chess_model import save_checkpoint, load_checkpoint
-from chess_env import encode, idx_to_move, move_to_idx, legal_mask, mirror_sample, ACTION_SIZE
+from chess_env import encode, idx_to_move, move_to_idx, legal_mask, mirror_sample, ACTION_SIZE, compute_concept_labels
 from chess_mcts import MCTS
 
 # ── Hyperparameters ────────────────────────────────────────────────────
@@ -134,13 +134,15 @@ def az_update(net, buf, opt, sched=None) -> float | None:
     if len(buf) < BATCH_SIZE:
         return None
 
-    states, policies, values = buf.sample(BATCH_SIZE)
+    states, policies, values, concept_labels = buf.sample(BATCH_SIZE)
     net.train()
-    policy_logits, value_pred = net(states)
+    policy_logits, value_pred, concepts_pred = net(states)
 
-    policy_loss = -(policies * F.log_softmax(policy_logits, dim=1)).sum(dim=1).mean()
-    value_loss  = F.mse_loss(value_pred, values)
-    loss        = policy_loss + 0.5 * value_loss   # λ=0.5 prevents value head dominating
+    policy_loss  = -(policies * F.log_softmax(policy_logits, dim=1)).sum(dim=1).mean()
+    value_loss   = F.mse_loss(value_pred, values)
+    concept_loss = F.mse_loss(concepts_pred, concept_labels)
+    # λ_value=0.5 prevents value head dominating; λ_concept=0.1 auxiliary signal
+    loss = policy_loss + 0.5 * value_loss + 0.1 * concept_loss
 
     opt.zero_grad()
     loss.backward()
@@ -162,7 +164,7 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
                  used by the web server to broadcast live positions.
     """
     board.reset()
-    records        = []    # (state_array, policy_array, player_color)
+    records        = []    # (state_array, policy_array, player_color, concept_labels)
     move_n         = 0
     consecutive_low = 0   # consecutive moves where root value < RESIGN_THRESHOLD
     resigned       = False
@@ -173,7 +175,7 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
         if book_mv is not None:
             policy_target = np.zeros(ACTION_SIZE, dtype=np.float32)
             policy_target[move_to_idx(book_mv)] = 1.0
-            records.append((encode(board), policy_target, board.turn))
+            records.append((encode(board), policy_target, board.turn, compute_concept_labels(board)))
             board.push(book_mv)
             move_n += 1
             if position_cb is not None:
@@ -204,7 +206,7 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
         total = counts.sum()
         policy_target = counts / total if total > 0 else counts
 
-        records.append((encode(board), policy_target, board.turn))
+        records.append((encode(board), policy_target, board.turn, compute_concept_labels(board)))
 
         mv = idx_to_move(action, board)
         if mv is None:
@@ -233,12 +235,9 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
 
     # Build training samples: fill in value_target from each player's perspective
     samples = []
-    for state, policy, color in records:
-        if winner is None:
-            v = 0.0
-        else:
-            v = 1.0 if color == winner else -1.0
-        samples.append((state, policy, v))
+    for state, policy, color, concepts in records:
+        v = 0.0 if winner is None else (1.0 if color == winner else -1.0)
+        samples.append((state, policy, v, concepts))
 
     return samples, result, move_n
 
@@ -282,9 +281,10 @@ def train():
         samples, result, n_moves = selfplay_game(board, mcts)
 
         # Store samples + mirrored augmentations (free 2× data)
-        for state, policy, value in samples:
-            buf.push(state, policy, value)
-            buf.push(*mirror_sample(state, policy, value))
+        # Concepts are board-state labels — unchanged by horizontal mirror
+        for state, policy, value, concepts in samples:
+            buf.push(state, policy, value, concepts)
+            buf.push(*mirror_sample(state, policy, value), concepts)
 
         # Gradient updates
         last_loss = None
