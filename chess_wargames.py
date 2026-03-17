@@ -30,9 +30,9 @@ from chess_mcts import MCTS
 TOTAL_GAMES  = 10_000
 REPORT_EVERY = 10         # games between CLI status lines
 BATCH_SIZE   = 512
-TRAIN_STEPS  = 5          # gradient steps after each game
-MCTS_SIMS    = 100        # simulations per move during self-play
-MAX_MOVES    = 80         # half-moves per game cap
+TRAIN_STEPS  = 15         # gradient steps after each game
+MCTS_SIMS    = 200        # simulations per move during self-play
+MAX_MOVES    = 256        # half-moves per game cap
 SAVE_EVERY   = 50         # games between checkpoint saves
 
 # Temperature decays exponentially: τ(n) = max(0.05, exp(-n / TEMP_DECAY))
