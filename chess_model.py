@@ -23,11 +23,11 @@ from chess_env import INPUT_PLANES
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ── Network config ────────────────────────────────────────────────────
-AZ_CHANNELS  = 256
-AZ_RES_BLOCKS = 20
+AZ_CHANNELS  = 128
+AZ_RES_BLOCKS = 10
 
 # ── Hyperparameters ───────────────────────────────────────────────────
-REPLAY_CAPACITY   = 200_000
+REPLAY_CAPACITY   = 20_000
 LR                = 1e-3
 WEIGHT_DECAY      = 1e-4
 ELO_DEFAULT_AI    = 800

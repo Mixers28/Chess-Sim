@@ -107,3 +107,29 @@ docker run -p 8000:8000 -v ./checkpoint:/app/checkpoint chess-sim
 
 - `chess_dqn.py`: Early DQN approach, not used in current pipeline.
 - `agent.py`, `game.py`, `wargames.py`: Tic-Tac-Toe Q-learning demo, completely separate from chess.
+
+
+## Reasoning Architecture (planned)
+
+### ConceptBottleneck
+- 6 concepts: material_balance, king_safety, piece_mobility, 
+  pawn_structure, space_control, tactical_threat
+- Inserted between res_tower and policy/value heads
+- Supervised with auto-labels from python-chess
+- Concept loss weight: 0.1
+
+### Transfer Learning Target: time:matters Logistics
+- LogisticsInputAdapter maps offer feature vectors → 256×8×8 latent
+- Chess res_tower trunk frozen initially, fine-tuned on offer outcomes
+- Offer features: origin, destination, cargo_class, weight_kg, 
+  deadline_hours, declared_value, dgr_class, service_tier
+- New heads: OfferRankingHead (top-5 routes), OfferValueHead 
+  (on-time probability × margin)
+
+### Concept → Logistics Mapping
+- material_balance    → margin_headroom
+- king_safety         → critical_node_risk  
+- piece_mobility      → route_optionality
+- pawn_structure      → supply_chain_dependency
+- space_control       → network_coverage
+- tactical_threat     → disruption_probability
