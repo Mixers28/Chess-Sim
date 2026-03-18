@@ -30,9 +30,9 @@ from chess_mcts import MCTS
 TOTAL_GAMES  = 10_000
 REPORT_EVERY = 10         # games between CLI status lines
 BATCH_SIZE   = 512
-TRAIN_STEPS  = 15         # gradient steps after each game
+TRAIN_STEPS  = 5          # gradient steps after each game
 MCTS_SIMS    = 50         # simulations per move during self-play
-MAX_MOVES    = 60          # half-moves per game cap
+MAX_MOVES    = 40         # half-moves per game cap
 SAVE_EVERY   = 50         # games between checkpoint saves
 
 # Temperature decays exponentially: τ(n) = max(0.05, exp(-n / TEMP_DECAY))
@@ -242,7 +242,7 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
     # Build training samples: fill in value_target from each player's perspective
     samples = []
     for state, policy, color, concepts, board_copy in records:
-        v = 0.0 if winner is None else (1.0 if color == winner else -1.0)
+        v = -0.15 if winner is None else (1.0 if color == winner else -1.0)
         samples.append((state, policy, v, concepts, board_copy))
 
     return samples, result, move_n
