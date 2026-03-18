@@ -27,7 +27,7 @@ AZ_CHANNELS  = 128
 AZ_RES_BLOCKS = 10
 
 # ── Hyperparameters ───────────────────────────────────────────────────
-REPLAY_CAPACITY   = 20_000
+REPLAY_CAPACITY   = 100_000
 LR                = 1e-3
 WEIGHT_DECAY      = 1e-4
 ELO_DEFAULT_AI    = 800
