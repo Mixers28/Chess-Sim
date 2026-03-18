@@ -35,7 +35,7 @@ from pydantic import BaseModel
 
 import chess_model as M
 from chess_model import load_checkpoint, save_checkpoint
-from chess_env import encode, idx_to_move, move_to_idx, legal_mask, mirror_sample, ACTION_SIZE
+from chess_env import encode, idx_to_move, move_to_idx, legal_mask, mirror_sample, ACTION_SIZE, compute_concept_labels
 from chess_mcts import MCTS
 from chess_wargames import az_update, selfplay_game
 
@@ -64,8 +64,8 @@ class HumanGame:
         self.active       = False
         self.move_history = []
         self.outcome      = None
-        self.traj_w       = []    # (state, policy) for white (human)
-        self.traj_b       = []    # (state, policy) for black (AI)
+        self.traj_w       = []    # (state, policy, concepts, board_copy) for white (human)
+        self.traj_b       = []    # (state, policy, concepts, board_copy) for black (AI)
         self.mcts_root    = None  # reuse MCTS tree between moves
         self.n_sims       = MCTS_SIMS_HUMAN  # difficulty (sims per move)
 
@@ -94,10 +94,14 @@ def _finalize_human_game():
     dummy_policy = np.zeros(ACTION_SIZE, dtype=np.float32)
 
     for traj, reward in [(current_game.traj_w, w_r), (current_game.traj_b, b_r)]:
-        for state, policy in traj:
+        for state, policy, concepts, board_copy in traj:
             p = policy if policy is not None else dummy_policy
-            M.replay_buf.push(state, p, reward)
-            M.replay_buf.push(*mirror_sample(state, p, reward))
+            M.replay_buf.push(state, p, reward, concepts)
+            ms, mp, mv = mirror_sample(state, p, reward)
+            mirrored_concepts = compute_concept_labels(
+                board_copy.transform(chess.flip_horizontal)
+            )
+            M.replay_buf.push(ms, mp, mv, mirrored_concepts)
 
     # Gradient update
     with M.model_lock:
@@ -145,9 +149,13 @@ def selfplay_loop():
 
             samples, _, _ = selfplay_game(board, mcts, position_cb=_broadcast)
 
-            for state, policy, value in samples:
-                M.replay_buf.push(state, policy, value)
-                M.replay_buf.push(*mirror_sample(state, policy, value))
+            for state, policy, value, concepts, board_copy in samples:
+                M.replay_buf.push(state, policy, value, concepts)
+                ms, mp, mv = mirror_sample(state, policy, value)
+                mirrored_concepts = compute_concept_labels(
+                    board_copy.transform(chess.flip_horizontal)
+                )
+                M.replay_buf.push(ms, mp, mv, mirrored_concepts)
 
             with M.model_lock:
                 for _ in range(TRAIN_STEPS):
@@ -375,7 +383,9 @@ async def human_move(req: MoveRequest):
         state  = encode(current_game.board)
         mask   = legal_mask(current_game.board)
         policy = mask / max(mask.sum(), 1.0)
-        current_game.traj_w.append((state, policy))
+        current_game.traj_w.append((state, policy,
+                                    compute_concept_labels(current_game.board),
+                                    current_game.board.copy(stack=False)))
 
         # Advance MCTS tree to match human's move
         if current_game.mcts_root is not None:
@@ -412,7 +422,7 @@ async def ai_move():
         state_t = torch.tensor(encode(board_snapshot), dtype=torch.float32) \
                        .unsqueeze(0).to(M.device)
         with torch.no_grad(), M.model_lock:
-            _, val_t = M.policy_net(state_t)
+            _, val_t, _ = M.policy_net(state_t)
         # val_t is from current player's (black/AI) perspective; claim if not winning
         if val_t.item() < -0.5:
             with game_lock:
@@ -446,7 +456,9 @@ async def ai_move():
         if mv not in current_game.board.legal_moves:
             raise HTTPException(500, "AI selected an illegal move.")
 
-        current_game.traj_b.append((state, policy))
+        current_game.traj_b.append((state, policy,
+                                    compute_concept_labels(board_snapshot),
+                                    board_snapshot.copy(stack=False)))
 
         # Store the subtree under AI's chosen move for next search
         current_game.mcts_root = new_root.children.get(action)

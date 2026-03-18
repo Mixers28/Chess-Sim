@@ -31,8 +31,8 @@ TOTAL_GAMES  = 10_000
 REPORT_EVERY = 10         # games between CLI status lines
 BATCH_SIZE   = 512
 TRAIN_STEPS  = 15         # gradient steps after each game
-MCTS_SIMS    = 200        # simulations per move during self-play
-MAX_MOVES    = 256        # half-moves per game cap
+MCTS_SIMS    = 50         # simulations per move during self-play
+MAX_MOVES    = 60          # half-moves per game cap
 SAVE_EVERY   = 50         # games between checkpoint saves
 
 # Temperature decays exponentially: τ(n) = max(0.05, exp(-n / TEMP_DECAY))
@@ -41,8 +41,8 @@ TEMP_DECAY   = 20.0
 
 # Resign: if MCTS root value stays below this for RESIGN_CONSECUTIVE moves, resign.
 # Won't trigger until the value head learns to produce values near ±1.
-RESIGN_THRESHOLD   = -0.9
-RESIGN_CONSECUTIVE = 5
+RESIGN_THRESHOLD   = -0.85
+RESIGN_CONSECUTIVE = 3
 
 
 # ── Opening book ───────────────────────────────────────────────────────
@@ -168,7 +168,7 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
                  used by the web server to broadcast live positions.
     """
     board.reset()
-    records        = []    # (state_array, policy_array, player_color, concept_labels)
+    records        = []    # (state_array, policy_array, player_color, concept_labels, board_copy)
     move_n         = 0
     consecutive_low = 0   # consecutive moves where root value < RESIGN_THRESHOLD
     resigned       = False
@@ -179,7 +179,8 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
         if book_mv is not None:
             policy_target = np.zeros(ACTION_SIZE, dtype=np.float32)
             policy_target[move_to_idx(book_mv)] = 1.0
-            records.append((encode(board), policy_target, board.turn, compute_concept_labels(board)))
+            records.append((encode(board), policy_target, board.turn,
+                            compute_concept_labels(board), board.copy(stack=False)))
             board.push(book_mv)
             move_n += 1
             if position_cb is not None:
@@ -210,7 +211,8 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
         total = counts.sum()
         policy_target = counts / total if total > 0 else counts
 
-        records.append((encode(board), policy_target, board.turn, compute_concept_labels(board)))
+        records.append((encode(board), policy_target, board.turn,
+                        compute_concept_labels(board), board.copy(stack=False)))
 
         mv = idx_to_move(action, board)
         if mv is None:
@@ -239,9 +241,9 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
 
     # Build training samples: fill in value_target from each player's perspective
     samples = []
-    for state, policy, color, concepts in records:
+    for state, policy, color, concepts, board_copy in records:
         v = 0.0 if winner is None else (1.0 if color == winner else -1.0)
-        samples.append((state, policy, v, concepts))
+        samples.append((state, policy, v, concepts, board_copy))
 
     return samples, result, move_n
 
@@ -286,10 +288,14 @@ def train():
         samples, result, n_moves = selfplay_game(board, mcts)
 
         # Store samples + mirrored augmentations (free 2× data)
-        # Concepts are board-state labels — unchanged by horizontal mirror
-        for state, policy, value, concepts in samples:
+        # Recompute concept labels for the mirrored board — spatial concepts differ.
+        for state, policy, value, concepts, board_copy in samples:
             buf.push(state, policy, value, concepts)
-            buf.push(*mirror_sample(state, policy, value), concepts)
+            ms, mp, mv = mirror_sample(state, policy, value)
+            mirrored_concepts = compute_concept_labels(
+                board_copy.transform(chess.flip_horizontal)
+            )
+            buf.push(ms, mp, mv, mirrored_concepts)
 
         # Gradient updates — accumulate split losses across steps for logging
         last_losses = None
