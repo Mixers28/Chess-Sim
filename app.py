@@ -191,18 +191,18 @@ async def lifespan(app: FastAPI):
     M.policy_net.eval()
     atexit.register(save_checkpoint)
 
-    _start_selfplay_thread()
-
     dev_str = str(M.device).upper()
     print(f"[app] AlphaZero+SE | {M.AZ_RES_BLOCKS} res blocks | "
           f"{M.AZ_CHANNELS} channels | {M.n_params:,} params | Device: {dev_str}")
     if M.device.type == "cpu":
-        print("[app] ⚠  GPU strongly recommended — self-play will be slow on CPU")
+        print("[app] CPU-only mode — background self-play disabled to preserve resources")
+    else:
+        _start_selfplay_thread()
 
     async def _watchdog():
         while not M.shutdown_flag:
             await asyncio.sleep(30)
-            if _sp_thread and not _sp_thread.is_alive() and not M.shutdown_flag:
+            if M.device.type == "cuda" and _sp_thread and not _sp_thread.is_alive() and not M.shutdown_flag:
                 print("[app] Selfplay thread died — restarting", flush=True)
                 _start_selfplay_thread()
 
