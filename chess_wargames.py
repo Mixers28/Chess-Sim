@@ -130,7 +130,11 @@ def _book_move(board: chess.Board) -> chess.Move | None:
 
 
 # ── AlphaZero training step ────────────────────────────────────────────
-def az_update(net, buf, opt, sched=None) -> float | None:
+def az_update(net, buf, opt, sched=None) -> tuple | None:
+    """
+    One gradient step. Returns (total, policy, value, concept) loss floats,
+    or None if the buffer is too small to sample a batch.
+    """
     if len(buf) < BATCH_SIZE:
         return None
 
@@ -151,7 +155,7 @@ def az_update(net, buf, opt, sched=None) -> float | None:
     if sched is not None:
         sched.step()
     net.eval()
-    return loss.item()
+    return loss.item(), policy_loss.item(), value_loss.item(), concept_loss.item()
 
 
 # ── One self-play game ─────────────────────────────────────────────────
@@ -271,9 +275,10 @@ def train():
         print("  ⚠  GPU strongly recommended — CPU self-play will be slow")
     print("=" * 72)
     print()
-    print(f"  {'Games':>8}  {'Result':>8}  {'Moves':>7}  {'Loss':>9}  "
+    print(f"  {'Games':>8}  {'Res':>6}  {'Mv':>5}  "
+          f"{'Loss (total  policy  value  concept)':<36}  "
           f"{'Buffer':>8}  {'Elo':>6}")
-    print("  " + "─" * 58)
+    print("  " + "─" * 82)
 
     t_game_start = time.time()
 
@@ -286,13 +291,13 @@ def train():
             buf.push(state, policy, value, concepts)
             buf.push(*mirror_sample(state, policy, value), concepts)
 
-        # Gradient updates
-        last_loss = None
+        # Gradient updates — accumulate split losses across steps for logging
+        last_losses = None
         with M.model_lock:
             for _ in range(TRAIN_STEPS):
                 l = az_update(net, buf, opt, M.scheduler)
                 if l is not None:
-                    last_loss = l
+                    last_losses = l
 
         M.total_games    = game_n
         M.selfplay_games += 1
@@ -300,16 +305,20 @@ def train():
         if game_n % REPORT_EVERY == 0:
             elapsed = time.time() - t_game_start
             gph = REPORT_EVERY / elapsed * 3600
-            loss_str = f"{last_loss:.4f}" if last_loss else "  —"
-            print(f"  {game_n:>8,}  {result:>8}  {n_moves:>7}  "
-                  f"{loss_str:>9}  {len(buf):>8,}  {M.ai_elo:>6.0f}"
-                  f"  ({gph:.1f} games/hr)")
+            if last_losses:
+                total, pol, val, con = last_losses
+                loss_str = f"{total:.3f} (p:{pol:.3f} v:{val:.3f} c:{con:.3f})"
+            else:
+                loss_str = "—"
+            print(f"  {game_n:>8,}  {result:>6}  {n_moves:>5}  "
+                  f"{loss_str:<36}  {len(buf):>8,}  {M.ai_elo:>6.0f}"
+                  f"  ({gph:.1f}/hr)")
             t_game_start = time.time()
 
         if game_n % SAVE_EVERY == 0:
             save_checkpoint()
 
-    print("  " + "─" * 58)
+    print("  " + "─" * 82)
     print(f"\n  Total games: {M.total_games:,}  |  Elo: {M.ai_elo:.0f}")
     print('\n  "The only winning move is not to play."\n')
 
