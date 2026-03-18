@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 import chess_model as M
 from chess_model import save_checkpoint, load_checkpoint
-from chess_env import encode, idx_to_move, move_to_idx, legal_mask, mirror_sample, ACTION_SIZE, compute_concept_labels
+from chess_env import encode, idx_to_move, move_to_idx, legal_mask, mirror_sample, ACTION_SIZE, compute_concept_labels, _PIECE_VALUES
 from chess_mcts import MCTS
 
 # ── Hyperparameters ────────────────────────────────────────────────────
@@ -33,6 +33,7 @@ BATCH_SIZE   = 512
 TRAIN_STEPS  = 5          # gradient steps after each game
 MCTS_SIMS    = 50         # simulations per move during self-play
 MAX_MOVES    = 40         # half-moves per game cap
+MATERIAL_WIN = 9          # material advantage (in pawns) treated as decisive win
 SAVE_EVERY   = 50         # games between checkpoint saves
 
 # Temperature decays exponentially: τ(n) = max(0.05, exp(-n / TEMP_DECAY))
@@ -222,6 +223,20 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
 
         if position_cb is not None:
             position_cb(board.fen(), mv.uci(), move_n)
+
+        # Material termination: queen-level imbalance treated as decisive
+        mat_w = sum(_PIECE_VALUES[p.piece_type]
+                    for p in board.piece_map().values() if p.color == chess.WHITE)
+        mat_b = sum(_PIECE_VALUES[p.piece_type]
+                    for p in board.piece_map().values() if p.color == chess.BLACK)
+        if abs(mat_w - mat_b) >= MATERIAL_WIN:
+            winner = chess.WHITE if mat_w > mat_b else chess.BLACK
+            result = "W" if winner == chess.WHITE else "B"
+            samples = []
+            for state, policy, color, concepts, board_copy in records:
+                v = 1.0 if color == winner else -1.0
+                samples.append((state, policy, v, concepts, board_copy))
+            return samples, result, move_n
 
     # Determine outcome
     if resigned:
