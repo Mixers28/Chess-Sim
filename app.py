@@ -142,6 +142,7 @@ def _finalize_human_game():
         M.human_draws  += 1
 
     M.record_elo()
+    current_game.active = False
     M.human_game_active.clear()
 
     if M.human_games % SAVE_EVERY_HU == 0:
