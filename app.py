@@ -22,6 +22,7 @@ import random
 import threading
 import time
 import traceback
+import uuid
 from contextlib import asynccontextmanager
 
 import chess
@@ -60,18 +61,39 @@ class HumanGame:
         self.reset()
 
     def reset(self):
-        self.board        = chess.Board()
-        self.active       = False
-        self.move_history = []
-        self.outcome      = None
-        self.traj_w       = []    # (state, policy, concepts, board_copy) for white (human)
-        self.traj_b       = []    # (state, policy, concepts, board_copy) for black (AI)
-        self.mcts_root    = None  # reuse MCTS tree between moves
-        self.n_sims       = MCTS_SIMS_HUMAN  # difficulty (sims per move)
+        self.board            = chess.Board()
+        self.active           = False
+        self.move_history     = []
+        self.outcome          = None
+        self.traj_w           = []    # (state, policy, concepts, board_copy) for white (human)
+        self.traj_b           = []    # (state, policy, concepts, board_copy) for black (AI)
+        self.mcts_root        = None  # reuse MCTS tree between moves
+        self.n_sims           = MCTS_SIMS_HUMAN  # difficulty (sims per move)
+        self.player_id        = None  # ID of the player currently in this game slot
 
 
 current_game = HumanGame()
 game_lock    = threading.Lock()
+
+# ── Player queue ───────────────────────────────────────────────────────
+# Each entry: {"player_id": str, "n_sims": int|None}
+_game_queue: list[dict] = []
+_queue_lock = threading.Lock()
+
+
+def _dequeue_next() -> None:
+    """Start the next queued game if anyone is waiting. Call after a game ends."""
+    with _queue_lock:
+        if not _game_queue:
+            return
+        entry = _game_queue.pop(0)
+    with game_lock:
+        current_game.reset()
+        current_game.active    = True
+        current_game.player_id = entry["player_id"]
+        if entry["n_sims"] is not None:
+            current_game.n_sims = max(5, min(entry["n_sims"], 800))
+    M.human_game_active.set()
 
 
 # ── Finalize human game (called under game_lock) ───────────────────────
@@ -124,6 +146,8 @@ def _finalize_human_game():
 
     if M.human_games % SAVE_EVERY_HU == 0:
         save_checkpoint()
+
+    _dequeue_next()
 
 
 # ── Background self-play thread ────────────────────────────────────────
@@ -243,6 +267,8 @@ async def get_state():
 
 @app.get("/api/stats")
 async def get_stats():
+    with _queue_lock:
+        q_len = len(_game_queue)
     return {
         "ai_elo":            round(M.ai_elo),
         "total_games":       M.total_games,
@@ -253,6 +279,7 @@ async def get_stats():
         "human_draws":       M.human_draws,
         "replay_buffer":     len(M.replay_buf),
         "human_game_active": M.human_game_active.is_set(),
+        "queue_length":      q_len,
         "device":            str(M.device),
         "selfplay_alive":    _sp_thread is not None and _sp_thread.is_alive(),
     }
@@ -332,13 +359,37 @@ async def selfplay_stream():
 
 @app.post("/api/new-game")
 async def new_game(sims: int = Query(default=None)):
+    player_id = str(uuid.uuid4())[:8]
     with game_lock:
+        if current_game.active:
+            # A game is in progress — add this player to the queue
+            with _queue_lock:
+                _game_queue.append({"player_id": player_id, "n_sims": sims})
+                position = len(_game_queue)
+            return {"status": "queued", "player_id": player_id, "position": position}
         current_game.reset()
-        current_game.active = True
+        current_game.active    = True
+        current_game.player_id = player_id
         if sims is not None:
             current_game.n_sims = max(5, min(sims, 800))
     M.human_game_active.set()
-    return {"status": "ok", "fen": chess.Board().fen(), "n_sims": current_game.n_sims}
+    return {"status": "ok", "player_id": player_id, "fen": chess.Board().fen(),
+            "n_sims": current_game.n_sims}
+
+
+@app.get("/api/queue-status")
+async def queue_status(player_id: str):
+    """Poll this while queued. Returns 'your_turn' when it's time to play."""
+    with game_lock:
+        if current_game.active and current_game.player_id == player_id:
+            return {"status": "your_turn", "fen": current_game.board.fen(),
+                    "n_sims": current_game.n_sims}
+    with _queue_lock:
+        for i, entry in enumerate(_game_queue):
+            if entry["player_id"] == player_id:
+                return {"status": "queued", "position": i + 1,
+                        "queue_length": len(_game_queue)}
+    return {"status": "not_found"}
 
 
 @app.post("/api/resign")
@@ -350,6 +401,7 @@ async def resign():
         current_game.active  = False
         current_game.outcome = "resigned"
     M.human_game_active.clear()
+    _dequeue_next()
     return {"status": "ok", "outcome": "resigned"}
 
 

@@ -207,6 +207,41 @@
     .dot.active { background: #4caf50; animation: pulse 1.2s infinite; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
 
+    /* Queue overlay */
+    #queue-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.85);
+      z-index: 100;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 18px;
+    }
+    #queue-overlay.visible { display: flex; }
+    #queue-overlay h2 {
+      font-size: 1.1rem;
+      letter-spacing: 0.2em;
+      color: #fff;
+    }
+    #queue-overlay p {
+      font-size: 0.82rem;
+      color: #888;
+      text-align: center;
+    }
+    #queue-position {
+      font-size: 2.5rem;
+      font-weight: bold;
+      color: #ffb300;
+    }
+    #queue-cancel {
+      width: auto;
+      padding: 8px 28px;
+      font-size: 0.75rem;
+      letter-spacing: 0.12em;
+    }
+
     /* ── Live self-play tab ── */
     #live-info {
       font-size: 0.78rem;
@@ -405,6 +440,14 @@
 </div>
 
 
+<!-- Queue overlay -->
+<div id="queue-overlay">
+  <h2>GAME IN PROGRESS</h2>
+  <div id="queue-position">—</div>
+  <p id="queue-msg">You are in the queue. Please wait…</p>
+  <button id="queue-cancel" onclick="cancelQueue()">Cancel</button>
+</div>
+
 <!-- JS Libraries -->
 <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
 <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
@@ -432,10 +475,12 @@ diffSlider.addEventListener('input', () => {
 });
 
 // ── Local chess.js mirror ─────────────────────────────────────────
-let game   = new Chess();
-let board  = null;
-let busy   = false;
-let active = false;
+let game      = new Chess();
+let board     = null;
+let busy      = false;
+let active    = false;
+let myPlayerId   = null;
+let queuePollId  = null;
 
 function initBoard() {
   board = Chessboard('board', {
@@ -524,24 +569,75 @@ function handleGameOver(outcome) {
   refreshStats();
 }
 
+// ── Queue helpers ─────────────────────────────────────────────────
+function showQueue(position) {
+  document.getElementById('queue-position').textContent = `#${position}`;
+  document.getElementById('queue-msg').textContent =
+    position === 1
+      ? 'You are next — waiting for current game to finish…'
+      : `You are #${position} in the queue. Please wait…`;
+  document.getElementById('queue-overlay').classList.add('visible');
+}
+
+function hideQueue() {
+  document.getElementById('queue-overlay').classList.remove('visible');
+  if (queuePollId) { clearInterval(queuePollId); queuePollId = null; }
+}
+
+function startQueuePolling() {
+  queuePollId = setInterval(async () => {
+    if (!myPlayerId) return;
+    try {
+      const res = await api('GET', `/api/queue-status?player_id=${myPlayerId}`);
+      if (res.status === 'queued') {
+        showQueue(res.position);
+      } else if (res.status === 'your_turn') {
+        hideQueue();
+        startGame(res.fen, res.n_sims);
+      } else {
+        // not_found — expired or cancelled
+        hideQueue();
+        myPlayerId = null;
+      }
+    } catch (_) {}
+  }, 2500);
+}
+
+function startGame(fen, n_sims) {
+  game.load(fen || 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1');
+  board.position(game.fen());
+  active = true;
+  busy   = false;
+  document.getElementById('move-list').innerHTML = '';
+  updatePV([]);
+  updateEvalBar(0);
+  setStatus('Your turn (White)');
+}
+
+async function cancelQueue() {
+  hideQueue();
+  myPlayerId = null;
+  setStatus('Press New Game to play.');
+}
+
 // ── New game ───────────────────────────────────────────────────────
 document.getElementById('btn-new').addEventListener('click', async () => {
   if (busy) return;
   busy = true;
   try {
     const sims = DIFF_SIMS[+diffSlider.value];
-    await api('POST', `/api/new-game?sims=${sims}`);
-    game.reset();
-    board.start();
-    active = true;
-    document.getElementById('move-list').innerHTML = '';
-    updatePV([]);
-    updateEvalBar(0);
-    setStatus('Your turn (White)');
+    const resp = await api('POST', `/api/new-game?sims=${sims}`);
+    myPlayerId = resp.player_id;
+    if (resp.status === 'queued') {
+      showQueue(resp.position);
+      startQueuePolling();
+      busy = false;  // allow other interactions while waiting
+    } else {
+      startGame(resp.fen, resp.n_sims);
+    }
   } catch (err) {
     console.error(err);
     setStatus('Failed to start game');
-  } finally {
     busy = false;
   }
 });
