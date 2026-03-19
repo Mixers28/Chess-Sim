@@ -1,0 +1,7 @@
+checkpoint/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+*.pgn

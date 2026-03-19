@@ -38,7 +38,7 @@ import chess_model as M
 from chess_model import load_checkpoint, save_checkpoint
 from chess_env import encode, idx_to_move, move_to_idx, legal_mask, mirror_sample, ACTION_SIZE, compute_concept_labels
 from chess_mcts import MCTS
-from chess_wargames import az_update, selfplay_game
+from chess_wargames import az_update, selfplay_game, RESIGN_THRESHOLD
 
 STATIC_DIR      = os.path.join(os.path.dirname(__file__), "static")
 import torch as _t
@@ -46,7 +46,6 @@ MCTS_SIMS_SP    = 100 if _t.cuda.is_available() else 20   # simulations per move
 MCTS_SIMS_HUMAN = 50 if _t.cuda.is_available() else 3
 TRAIN_STEPS     = 5     # gradient steps after each game
 SAVE_EVERY_SP   = 50    # self-play games between saves
-SAVE_EVERY_HU   = 10    # human games between saves
 MAX_MOVES       = 256
 
 
@@ -97,11 +96,13 @@ def _dequeue_next() -> None:
 
 
 # ── Finalize human game (called under game_lock) ───────────────────────
-def _finalize_human_game():
+def _finalize_human_game(ai_resigned: bool = False):
     board   = current_game.board
     outcome = board.outcome()
 
-    if outcome is None:
+    if ai_resigned:
+        result, w_r, b_r, ai_score = "white", 1.0, -1.0, 0.0   # human wins
+    elif outcome is None:
         result, w_r, b_r, ai_score = "draw", 0.0, 0.0, 0.5
     elif outcome.winner == chess.WHITE:
         result, w_r, b_r, ai_score = "white", 1.0, -1.0, 0.0
@@ -144,10 +145,7 @@ def _finalize_human_game():
     M.record_elo()
     current_game.active = False
     M.human_game_active.clear()
-
-    if M.human_games % SAVE_EVERY_HU == 0:
-        save_checkpoint()
-
+    save_checkpoint()   # always save after each human game (keeps stats.pt current on Coolify)
     _dequeue_next()
 
 
@@ -492,6 +490,15 @@ async def ai_move():
         )
 
     pv = mcts.get_pv(new_root, board_snapshot)
+
+    # Resign if position is hopeless (root Q is from AI/Black's perspective)
+    # Only resign if there have been enough moves to form a meaningful position
+    if new_root.Q < RESIGN_THRESHOLD and len(board_snapshot.move_stack) >= 10:
+        with game_lock:
+            if current_game.active and current_game.outcome is None:
+                _finalize_human_game(ai_resigned=True)
+        return {"move": None, "status": "game_over", "outcome": "white",
+                "fen": board_snapshot.fen(), "pv": []}
 
     mv = idx_to_move(action, board_snapshot)
     if mv is None:

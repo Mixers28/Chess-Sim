@@ -249,6 +249,7 @@ def _load_stats(path: str) -> None:
     global total_games, selfplay_games, human_games
     global human_wins, human_losses, human_draws, ai_elo, elo_history
     if not os.path.exists(path):
+        print(f"[checkpoint] Warning: {path} not found — stats reset to defaults")
         return
     s = torch.load(path, map_location="cpu", weights_only=True)
     total_games    = s.get("total_games",    0)

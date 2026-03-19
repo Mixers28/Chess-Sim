@@ -1,7 +1,9 @@
 import chess
 import torch
 from chess_env import encode, compute_concept_labels, CONCEPT_NAMES
-from chess_model import policy_net, device
+from chess_model import policy_net, device, load_checkpoint
+
+load_checkpoint()
 
 def probe(label, board):
     x = torch.tensor(encode(board), dtype=torch.float32).unsqueeze(0).to(device)
