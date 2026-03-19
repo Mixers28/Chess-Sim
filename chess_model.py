@@ -4,6 +4,13 @@ chess_model.py — Shared singleton state for the AlphaZero chess engine.
 Imported by both chess_wargames.py (standalone training)
 and app.py (web server + background self-play).
 All mutable state lives here as module globals.
+
+Checkpoint split:
+  model.pt  — weights, optimizer, scheduler (GPU owns; pushed to Coolify)
+  stats.pt  — Elo, game counts (each machine owns its own copy)
+
+Set env var SYNC_MODEL_TARGET=user@host:/path/model.pt to auto-push
+model.pt to Coolify after each save.
 """
 
 import os
@@ -34,9 +41,17 @@ ELO_DEFAULT_AI    = 800
 ELO_DEFAULT_HUMAN = 1200
 ELO_K             = 32
 
-# ── Checkpoint ────────────────────────────────────────────────────────
+# ── Checkpoint paths ──────────────────────────────────────────────────
 CHECKPOINT_DIR  = os.path.join(os.path.dirname(__file__), "checkpoint")
-CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "checkpoint.pt")
+CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "checkpoint.pt")  # legacy
+MODEL_PATH      = os.path.join(CHECKPOINT_DIR, "model.pt")       # weights (shared)
+STATS_PATH      = os.path.join(CHECKPOINT_DIR, "stats.pt")       # Elo/counts (local)
+BUFFER_PATH     = os.path.join(CHECKPOINT_DIR, "replay_buffer.npz")
+BUFFER_SEED_SIZE = 20_000   # max samples persisted across restarts
+
+# Optional: set to auto-push model.pt to Coolify after each save
+# e.g. export SYNC_MODEL_TARGET=user@server:/data/chess-sim/checkpoint/model.pt
+SYNC_MODEL_TARGET = os.environ.get("SYNC_MODEL_TARGET", "")
 
 # ── Shared model objects ──────────────────────────────────────────────
 policy_net = AlphaZeroNet(AZ_CHANNELS, AZ_RES_BLOCKS).to(device)
@@ -109,16 +124,17 @@ def update_elo(current_ai_elo: float,
     return current_ai_elo + ELO_K * (ai_score - expected)
 
 
-# ── Checkpoint save ───────────────────────────────────────────────────
 def record_elo() -> None:
     """Append the current (total_games, ai_elo) to elo_history."""
     global elo_history
     elo_history.append([total_games, round(ai_elo)])
 
 
+# ── Checkpoint save ───────────────────────────────────────────────────
 def save_checkpoint() -> None:
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     with model_lock:
+        # model.pt — weights only, shared between machines
         torch.save({
             "policy_state_dict": policy_net.state_dict(),
             "optimizer_state":   optimizer.state_dict(),
@@ -126,35 +142,88 @@ def save_checkpoint() -> None:
             "az_channels":       AZ_CHANNELS,
             "az_res_blocks":     AZ_RES_BLOCKS,
             "az_input_planes":   INPUT_PLANES,
-            "total_games":       total_games,
-            "selfplay_games":    selfplay_games,
-            "human_games":       human_games,
-            "human_wins":        human_wins,
-            "human_losses":      human_losses,
-            "human_draws":       human_draws,
-            "ai_elo":            ai_elo,
-            "elo_history":       elo_history,
-        }, CHECKPOINT_PATH)
+        }, MODEL_PATH)
+        # stats.pt — Elo and game counts, local to each machine
+        torch.save({
+            "total_games":    total_games,
+            "selfplay_games": selfplay_games,
+            "human_games":    human_games,
+            "human_wins":     human_wins,
+            "human_losses":   human_losses,
+            "human_draws":    human_draws,
+            "ai_elo":         ai_elo,
+            "elo_history":    elo_history,
+        }, STATS_PATH)
     print(f"[checkpoint] Saved — games: {total_games:,}  Elo: {ai_elo:.0f}")
+    save_replay_buffer()
+    _sync_model()
+
+
+def _sync_model() -> None:
+    """Push model.pt to Coolify if SYNC_MODEL_TARGET env var is set."""
+    if not SYNC_MODEL_TARGET:
+        return
+    ret = os.system(f"scp {MODEL_PATH} {SYNC_MODEL_TARGET} 2>/dev/null")
+    if ret == 0:
+        print(f"[sync] model.pt → {SYNC_MODEL_TARGET}")
+    else:
+        print(f"[sync] Warning: SCP failed (exit {ret})")
+
+
+# ── Replay buffer save/load ───────────────────────────────────────────
+def save_replay_buffer() -> None:
+    """Persist up to BUFFER_SEED_SIZE samples to disk (float16 to save space)."""
+    if len(replay_buf) == 0:
+        return
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    buf_list = list(replay_buf.buf)
+    # Take the most recent BUFFER_SEED_SIZE samples
+    buf_list = buf_list[-BUFFER_SEED_SIZE:]
+    s, p, v, c = zip(*buf_list)
+    np.savez_compressed(
+        BUFFER_PATH,
+        states   = np.array(s, dtype=np.float16),
+        policies = np.array(p, dtype=np.float16),
+        values   = np.array(v, dtype=np.float32),
+        concepts = np.array(c, dtype=np.float32),
+    )
+    print(f"[buffer] Saved {len(buf_list):,} samples → {BUFFER_PATH}")
+
+
+def load_replay_buffer() -> int:
+    """Restore persisted samples into the replay buffer. Returns count loaded."""
+    if not os.path.exists(BUFFER_PATH):
+        return 0
+    data = np.load(BUFFER_PATH)
+    states   = data["states"].astype(np.float32)
+    policies = data["policies"].astype(np.float32)
+    values   = data["values"]
+    concepts = data["concepts"]
+    for i in range(len(values)):
+        replay_buf.push(states[i], policies[i], float(values[i]), concepts[i])
+    print(f"[buffer] Loaded {len(values):,} seed samples from disk")
+    return len(values)
 
 
 # ── Checkpoint load ───────────────────────────────────────────────────
 def load_checkpoint() -> bool:
-    global total_games, selfplay_games, human_games
-    global human_wins, human_losses, human_draws, ai_elo, elo_history
+    """Load checkpoint — new split format first, legacy fallback for migration."""
+    if os.path.exists(MODEL_PATH):
+        return _load_split()
+    if os.path.exists(CHECKPOINT_PATH):
+        print("[checkpoint] Migrating legacy checkpoint.pt → split format")
+        return _load_legacy()
+    return False
 
-    if not os.path.exists(CHECKPOINT_PATH):
-        return False
 
-    ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=True)
-
-    # Verify architecture matches
+def _load_model_weights(path: str) -> bool:
+    """Load weights/optimizer/scheduler from path. Returns False on mismatch."""
+    ckpt = torch.load(path, map_location=device, weights_only=True)
     if (ckpt.get("az_channels") != AZ_CHANNELS or
             ckpt.get("az_res_blocks") != AZ_RES_BLOCKS or
             ckpt.get("az_input_planes") != INPUT_PLANES):
         print("[checkpoint] Architecture mismatch — starting fresh.")
         return False
-
     try:
         policy_net.load_state_dict(ckpt["policy_state_dict"], strict=False)
         optimizer.load_state_dict(ckpt["optimizer_state"])
@@ -163,7 +232,53 @@ def load_checkpoint() -> bool:
     except Exception as e:
         print(f"[checkpoint] State dict mismatch ({e}) — starting fresh.")
         return False
+    return True
 
+
+def _load_stats(path: str) -> None:
+    """Load Elo and game counts from stats file."""
+    global total_games, selfplay_games, human_games
+    global human_wins, human_losses, human_draws, ai_elo, elo_history
+    if not os.path.exists(path):
+        return
+    s = torch.load(path, map_location="cpu", weights_only=True)
+    total_games    = s.get("total_games",    0)
+    selfplay_games = s.get("selfplay_games", 0)
+    human_games    = s.get("human_games",    0)
+    human_wins     = s.get("human_wins",     0)
+    human_losses   = s.get("human_losses",   0)
+    human_draws    = s.get("human_draws",    0)
+    ai_elo         = float(s.get("ai_elo",   ELO_DEFAULT_AI))
+    elo_history    = s.get("elo_history", [])
+
+
+def _load_split() -> bool:
+    if not _load_model_weights(MODEL_PATH):
+        return False
+    _load_stats(STATS_PATH)
+    print(f"[checkpoint] Resuming — games: {total_games:,}  Elo: {ai_elo:.0f}")
+    load_replay_buffer()
+    return True
+
+
+def _load_legacy() -> bool:
+    """Load old single-file checkpoint.pt and migrate to split format on next save."""
+    global total_games, selfplay_games, human_games
+    global human_wins, human_losses, human_draws, ai_elo, elo_history
+    ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=True)
+    if (ckpt.get("az_channels") != AZ_CHANNELS or
+            ckpt.get("az_res_blocks") != AZ_RES_BLOCKS or
+            ckpt.get("az_input_planes") != INPUT_PLANES):
+        print("[checkpoint] Architecture mismatch — starting fresh.")
+        return False
+    try:
+        policy_net.load_state_dict(ckpt["policy_state_dict"], strict=False)
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        if "scheduler_state" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state"])
+    except Exception as e:
+        print(f"[checkpoint] State dict mismatch ({e}) — starting fresh.")
+        return False
     total_games    = ckpt.get("total_games",    0)
     selfplay_games = ckpt.get("selfplay_games", 0)
     human_games    = ckpt.get("human_games",    0)
@@ -172,6 +287,6 @@ def load_checkpoint() -> bool:
     human_draws    = ckpt.get("human_draws",    0)
     ai_elo         = float(ckpt.get("ai_elo",   ELO_DEFAULT_AI))
     elo_history    = ckpt.get("elo_history", [])
-
-    print(f"[checkpoint] Resuming from game {total_games:,}  (Elo: {ai_elo:.0f})")
+    print(f"[checkpoint] Migrated — games: {total_games:,}  Elo: {ai_elo:.0f}")
+    load_replay_buffer()
     return True

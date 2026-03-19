@@ -32,8 +32,8 @@ REPORT_EVERY = 10         # games between CLI status lines
 BATCH_SIZE   = 512
 TRAIN_STEPS  = 5          # gradient steps after each game
 MCTS_SIMS    = 50         # simulations per move during self-play
-MAX_MOVES    = 40         # half-moves per game cap
-MATERIAL_WIN = 9          # material advantage (in pawns) treated as decisive win
+MAX_MOVES    = 60         # half-moves per game cap
+MATERIAL_WIN = 6          # material advantage (in pawns) treated as decisive win
 SAVE_EVERY   = 50         # games between checkpoint saves
 
 # Temperature decays exponentially: τ(n) = max(0.05, exp(-n / TEMP_DECAY))
@@ -42,7 +42,7 @@ TEMP_DECAY   = 20.0
 
 # Resign: if MCTS root value stays below this for RESIGN_CONSECUTIVE moves, resign.
 # Won't trigger until the value head learns to produce values near ±1.
-RESIGN_THRESHOLD   = -0.85
+RESIGN_THRESHOLD   = -0.70
 RESIGN_CONSECUTIVE = 3
 
 
@@ -146,8 +146,8 @@ def az_update(net, buf, opt, sched=None) -> tuple | None:
     policy_loss  = -(policies * F.log_softmax(policy_logits, dim=1)).sum(dim=1).mean()
     value_loss   = F.mse_loss(value_pred, values)
     concept_loss = F.mse_loss(concepts_pred, concept_labels)
-    # λ_value=0.5 prevents value head dominating; λ_concept=0.1 auxiliary signal
-    loss = policy_loss + 0.5 * value_loss + 0.1 * concept_loss
+    # λ_value=2.0 amplifies value gradient to prevent collapse; λ_concept=0.1 auxiliary signal
+    loss = policy_loss + 2.0 * value_loss + 0.1 * concept_loss
 
     opt.zero_grad()
     loss.backward()
