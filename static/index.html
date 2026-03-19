@@ -371,6 +371,11 @@
       </div>
 
       <div class="card">
+        <h3>AI reasoning</h3>
+        <div id="reasoning-line" style="font-size:0.82rem;color:#aaa;min-height:1.2em;font-style:italic;">—</div>
+      </div>
+
+      <div class="card">
         <h3>Move History</h3>
         <div id="move-list"></div>
       </div>
@@ -546,6 +551,7 @@ async function onDrop(source, target) {
 
     updateMoveHistory();
     updatePV(aiResp.pv || []);
+    updateReasoning(aiResp.reasoning || '');
     refreshEval();
 
     if (aiResp.status === 'game_over') {
@@ -610,6 +616,7 @@ function startGame(fen, n_sims) {
   busy   = false;
   document.getElementById('move-list').innerHTML = '';
   updatePV([]);
+  updateReasoning('');
   updateEvalBar(0);
   setStatus('Your turn (White)');
 }
@@ -688,6 +695,10 @@ function updateMoveHistory() {
 // ── PV display ────────────────────────────────────────────────────
 function updatePV(pv) {
   document.getElementById('pv-line').textContent = pv.length ? pv.join(' ') : '—';
+}
+
+function updateReasoning(text) {
+  document.getElementById('reasoning-line').textContent = text || '—';
 }
 
 // ── Eval bar ─────────────────────────────────────────────────────

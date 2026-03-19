@@ -36,7 +36,7 @@ from pydantic import BaseModel
 
 import chess_model as M
 from chess_model import load_checkpoint, save_checkpoint
-from chess_env import encode, idx_to_move, move_to_idx, legal_mask, mirror_sample, ACTION_SIZE, compute_concept_labels
+from chess_env import encode, idx_to_move, move_to_idx, legal_mask, mirror_sample, ACTION_SIZE, compute_concept_labels, narrate_concepts
 from chess_mcts import MCTS
 from chess_wargames import az_update, selfplay_game, RESIGN_THRESHOLD
 
@@ -519,8 +519,9 @@ async def ai_move():
         if mv not in current_game.board.legal_moves:
             raise HTTPException(500, "AI selected an illegal move.")
 
-        current_game.traj_b.append((state, policy,
-                                    compute_concept_labels(board_snapshot),
+        concepts = compute_concept_labels(board_snapshot)
+        reasoning = narrate_concepts(concepts)
+        current_game.traj_b.append((state, policy, concepts,
                                     board_snapshot.copy(stack=False)))
 
         # Store the subtree under AI's chosen move for next search
@@ -533,10 +534,12 @@ async def ai_move():
             _finalize_human_game()
             return {"move": mv.uci(), "status": "game_over",
                     "outcome": current_game.outcome,
-                    "fen": current_game.board.fen(), "pv": pv}
+                    "fen": current_game.board.fen(), "pv": pv,
+                    "reasoning": reasoning}
 
         return {"move": mv.uci(), "status": "ok",
-                "fen": current_game.board.fen(), "pv": pv}
+                "fen": current_game.board.fen(), "pv": pv,
+                "reasoning": reasoning}
 
 
 # ── Entry point ───────────────────────────────────────────────────────

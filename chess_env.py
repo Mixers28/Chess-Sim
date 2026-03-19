@@ -112,6 +112,68 @@ def compute_concept_labels(board: chess.Board) -> np.ndarray:
         dtype=np.float32,
     )
 
+
+def narrate_concepts(concepts) -> str:
+    """
+    Convert 6 concept scores to a plain-English position description.
+    All scores are from the side-to-move's perspective, in [0, 1].
+    0.5 ≈ neutral; higher = better for the moving side.
+    """
+    if len(concepts) < 6:
+        return ""
+    mb, ks, pm, ps, sc, tt = (float(c) for c in concepts[:6])
+
+    parts = []
+
+    # Material balance (sigmoid: 0.5 = equal, 0.62 ≈ +3 pawns ahead)
+    if mb > 0.62:
+        parts.append("I'm up on material")
+    elif mb < 0.38:
+        parts.append("I'm down on material")
+    else:
+        parts.append("material is equal")
+
+    # King safety (sigmoid of shield − attackers)
+    if ks < 0.35:
+        parts.append("my king is under pressure")
+    elif ks > 0.70:
+        parts.append("my king is safe")
+
+    # Piece mobility (legal_moves / 40; 0.5 ≈ 20 moves, 1.0 ≈ 40+ moves)
+    if pm > 0.65:
+        parts.append("my pieces are active")
+    elif pm < 0.35:
+        parts.append("my pieces are cramped")
+
+    # Pawn structure (1 − islands/4)
+    if ps < 0.35:
+        parts.append("my pawns are weak")
+    elif ps > 0.70:
+        parts.append("my pawn structure is solid")
+
+    # Space control (fraction of center squares attacked)
+    if sc > 0.60:
+        parts.append("I control more space")
+    elif sc < 0.25:
+        parts.append("I'm short on space")
+
+    # Tactical threat (captures / legal_moves)
+    if tt > 0.35:
+        parts.append("there are sharp tactics")
+    elif tt > 0.20:
+        parts.append("I see a tactical opportunity")
+
+    if not parts:
+        return "The position is balanced."
+
+    first = parts[0].capitalize()
+    if len(parts) == 1:
+        return first + "."
+    elif len(parts) == 2:
+        return first + ", and " + parts[1] + "."
+    else:
+        return first + ", " + ", ".join(parts[1:-1]) + ", and " + parts[-1] + "."
+
 # piece_type (1-indexed) → plane offset
 _PT_OFFSET = {
     chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
