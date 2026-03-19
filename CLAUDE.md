@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Session Hygiene
+
+- At the start of every session, read all files in `~/.claude/projects/-mnt-e-GD-Chess-Sim/memory/` to load context.
+- After any significant decision, architectural change, or user correction, update or create the relevant memory file and refresh `MEMORY.md`.
+- In long sessions: re-check memory files after every ~10 tool calls or whenever the topic shifts, and update stale entries before the session ends.
+
 ## Running the Project
 
 ```bash
@@ -17,7 +23,12 @@ python wargames.py
 
 **Dependencies**: Python 3.10+, PyTorch, FastAPI, Uvicorn, python-chess, numpy, pydantic. GPU strongly recommended; CPU self-play is ~1.2s/simulation.
 
-Checkpoints are saved to `checkpoint/checkpoint.pt` (excluded from git due to size) — automatically every 50 self-play games or every 10 human games.
+Checkpoints are saved to `checkpoint/` (excluded from git) — automatically every 50 self-play games or every 10 human games:
+- `model.pt` — weights, optimizer, scheduler (shared across machines; pushed to Coolify if `SYNC_MODEL_TARGET=user@host:/path/model.pt` is set)
+- `stats.pt` — Elo, game counts (per-machine)
+- `replay_buffer.npz` — up to 20k samples seeded across restarts
+
+**Virtual env**: `./venv/` — activate with `source venv/bin/activate`.
 
 ## Architecture
 
@@ -47,10 +58,10 @@ app.py                (FastAPI server, background selfplay thread, human game lo
 
 | Constant | Value | Notes |
 |---|---|---|
-| `AZ_CHANNELS` / `AZ_RES_BLOCKS` | 256 / 20 | Network size |
+| `AZ_CHANNELS` / `AZ_RES_BLOCKS` | 128 / 10 | Network size |
 | `INPUT_PLANES` | 19 | Board encoding depth |
 | `ACTION_SIZE` | 8192 | 4096 standard + 4096 knight underpromotions |
-| `REPLAY_CAPACITY` | 200,000 | Circular training buffer |
+| `REPLAY_CAPACITY` | 100,000 | Circular training buffer |
 | `MCTS_SIMS_SP` | 100 | Self-play simulations/move |
 | `MCTS_SIMS_HUMAN` | 50/10 | GPU/CPU simulations for human play |
 | `MAX_MOVES` | 80 | Half-move cap before draw |
@@ -109,13 +120,13 @@ docker run -p 8000:8000 -v ./checkpoint:/app/checkpoint chess-sim
 - `agent.py`, `game.py`, `wargames.py`: Tic-Tac-Toe Q-learning demo, completely separate from chess.
 
 
-## Reasoning Architecture (planned)
+## Reasoning Architecture
 
-### ConceptBottleneck
-- 6 concepts: material_balance, king_safety, piece_mobility, 
+### ConceptBottleneck (implemented in `chess_net.py`)
+- 6 concepts: material_balance, king_safety, piece_mobility,
   pawn_structure, space_control, tactical_threat
-- Inserted between res_tower and policy/value heads
-- Supervised with auto-labels from python-chess
+- Auxiliary head off the res_tower; does NOT bottleneck policy/value heads
+- Supervised with auto-labels from `chess_env.compute_concept_labels()`
 - Concept loss weight: 0.1
 
 ### Transfer Learning Target: time:matters Logistics

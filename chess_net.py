@@ -137,5 +137,5 @@ class AlphaZeroNet(nn.Module):
         x        = self.res_tower(x)
         policy   = self.policy_head(x)            # (B, ACTION_SIZE)
         value    = self.value_head(x).squeeze(1)  # (B,)
-        concepts = self.concept_bottleneck(x)     # (B, N_CONCEPTS)
+        concepts = self.concept_bottleneck(x.detach())  # (B, N_CONCEPTS) — detached: head trains on fixed trunk features, no gradient competition
         return policy, value, concepts

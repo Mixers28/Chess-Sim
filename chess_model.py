@@ -52,10 +52,19 @@ BUFFER_SEED_SIZE = 20_000   # max samples persisted across restarts
 # Optional: set to auto-push model.pt to Coolify after each save
 # e.g. export SYNC_MODEL_TARGET=user@server:/data/chess-sim/checkpoint/model.pt
 SYNC_MODEL_TARGET = os.environ.get("SYNC_MODEL_TARGET", "")
+SYNC_MODEL_PORT   = os.environ.get("SYNC_MODEL_PORT", "22")
 
 # ── Shared model objects ──────────────────────────────────────────────
 policy_net = AlphaZeroNet(AZ_CHANNELS, AZ_RES_BLOCKS).to(device)
-optimizer  = optim.Adam(policy_net.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+# Main optimizer excludes concept head (weight decay was collapsing it)
+_trunk_params   = [p for n, p in policy_net.named_parameters()
+                   if "concept_bottleneck" not in n]
+_concept_params = list(policy_net.concept_bottleneck.parameters())
+optimizer = optim.Adam([
+    {"params": _trunk_params,   "lr": LR, "weight_decay": WEIGHT_DECAY},
+    {"params": _concept_params, "lr": LR, "weight_decay": 0.0},
+])
 
 # Cosine annealing with warm restarts: LR decays smoothly then resets.
 # T_0=2000 opt steps per first cycle; each restart doubles the cycle length.
@@ -163,7 +172,7 @@ def _sync_model() -> None:
     """Push model.pt to Coolify if SYNC_MODEL_TARGET env var is set."""
     if not SYNC_MODEL_TARGET:
         return
-    ret = os.system(f"scp {MODEL_PATH} {SYNC_MODEL_TARGET} 2>/dev/null")
+    ret = os.system(f"scp -P {SYNC_MODEL_PORT} {MODEL_PATH} {SYNC_MODEL_TARGET} 2>/dev/null")
     if ret == 0:
         print(f"[sync] model.pt → {SYNC_MODEL_TARGET}")
     else:

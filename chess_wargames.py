@@ -13,8 +13,10 @@ Training data per game:
 
 import atexit
 import math
+import multiprocessing as _mp
 import random
 import time
+from concurrent.futures import ProcessPoolExecutor
 
 import chess
 import numpy as np
@@ -25,6 +27,7 @@ import chess_model as M
 from chess_model import save_checkpoint, load_checkpoint
 from chess_env import encode, idx_to_move, move_to_idx, legal_mask, mirror_sample, ACTION_SIZE, compute_concept_labels, _PIECE_VALUES
 from chess_mcts import MCTS
+from chess_net import AlphaZeroNet
 
 # ── Hyperparameters ────────────────────────────────────────────────────
 TOTAL_GAMES  = 10_000
@@ -44,6 +47,7 @@ TEMP_DECAY   = 20.0
 # Won't trigger until the value head learns to produce values near ±1.
 RESIGN_THRESHOLD   = -0.70
 RESIGN_CONSECUTIVE = 3
+N_WORKERS          = 4 if torch.cuda.is_available() else 1  # parallel self-play workers
 
 
 # ── Opening book ───────────────────────────────────────────────────────
@@ -145,9 +149,14 @@ def az_update(net, buf, opt, sched=None) -> tuple | None:
 
     policy_loss  = -(policies * F.log_softmax(policy_logits, dim=1)).sum(dim=1).mean()
     value_loss   = F.mse_loss(value_pred, values)
-    concept_loss = F.mse_loss(concepts_pred, concept_labels)
-    # λ_value=2.0 amplifies value gradient to prevent collapse; λ_concept=0.1 auxiliary signal
-    loss = policy_loss + 2.0 * value_loss + 0.1 * concept_loss
+    # Mask out legacy zero-labeled samples (saved before concept tracking was added)
+    concept_mask = concept_labels.sum(dim=1) > 0
+    if concept_mask.any():
+        concept_loss = F.mse_loss(concepts_pred[concept_mask], concept_labels[concept_mask])
+    else:
+        concept_loss = torch.zeros(1, device=concept_labels.device)
+    # λ_value=2.0 amplifies value gradient to prevent collapse; λ_concept=1.0 drives concept learning
+    loss = policy_loss + 2.0 * value_loss + 1.0 * concept_loss
 
     opt.zero_grad()
     loss.backward()
@@ -263,6 +272,40 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
     return samples, result, move_n
 
 
+# ── Multiprocessing worker ─────────────────────────────────────────────
+# Module-level globals so each worker process initialises once
+_w_net  = None
+_w_mcts = None
+_w_dev  = None
+
+
+def _worker_init(az_channels, az_res_blocks):
+    """Run once per worker process: create model + MCTS on GPU."""
+    global _w_net, _w_mcts, _w_dev
+    import torch
+    _w_dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _w_net = AlphaZeroNet(az_channels, az_res_blocks).to(_w_dev)
+    _w_net.eval()
+    _w_mcts = MCTS(_w_net, _w_dev, n_sims=MCTS_SIMS)
+
+
+def _play_game(state_dict_cpu):
+    """Play one game with updated weights. Returns processed samples (no Board objects)."""
+    global _w_net, _w_mcts, _w_dev
+    import torch
+    _w_net.load_state_dict({k: v.to(_w_dev) for k, v in state_dict_cpu.items()})
+    _w_net.eval()
+    raw_samples, result, n_moves = selfplay_game(chess.Board(), _w_mcts)
+    # Pre-compute mirrored samples here — avoids pickling Board objects over IPC
+    processed = []
+    for state, policy, value, concepts, board_copy in raw_samples:
+        processed.append((state, policy, value, concepts))
+        ms, mp_arr, mv = mirror_sample(state, policy, value)
+        mc = compute_concept_labels(board_copy.transform(chess.flip_horizontal))
+        processed.append((ms, mp_arr, mv, mc))
+    return processed, result, n_moves
+
+
 # ── Training loop ──────────────────────────────────────────────────────
 def train():
     if not load_checkpoint():
@@ -275,11 +318,7 @@ def train():
     opt  = M.optimizer
     dev  = M.device
 
-    net.eval()
-    mcts = MCTS(net, dev, n_sims=MCTS_SIMS)
-
     start = M.total_games + 1
-    board = chess.Board()
 
     print()
     print("=" * 72)
@@ -287,7 +326,8 @@ def train():
     print(f"  Device: {str(dev).upper()}  |  "
           f"{M.AZ_RES_BLOCKS} res blocks  |  "
           f"{M.AZ_CHANNELS} channels  |  "
-          f"{M.n_params:,} params")
+          f"{M.n_params:,} params  |  "
+          f"{N_WORKERS} workers")
     if dev.type == "cpu":
         print("  ⚠  GPU strongly recommended — CPU self-play will be slow")
     print("=" * 72)
@@ -297,47 +337,61 @@ def train():
           f"{'Buffer':>8}  {'Elo':>6}")
     print("  " + "─" * 82)
 
-    t_game_start = time.time()
+    t_round_start = time.time()
+    game_n = start
 
-    for game_n in range(start, start + TOTAL_GAMES):
-        samples, result, n_moves = selfplay_game(board, mcts)
+    with ProcessPoolExecutor(
+        max_workers=N_WORKERS,
+        initializer=_worker_init,
+        initargs=(M.AZ_CHANNELS, M.AZ_RES_BLOCKS),
+        mp_context=_mp.get_context("spawn"),
+    ) as executor:
+        while game_n < start + TOTAL_GAMES:
+            # Serialize current weights once, send to all workers
+            state_dict_cpu = {k: v.cpu() for k, v in net.state_dict().items()}
+            futures = [executor.submit(_play_game, state_dict_cpu)
+                       for _ in range(N_WORKERS)]
+            round_results = [f.result() for f in futures]
 
-        # Store samples + mirrored augmentations (free 2× data)
-        # Recompute concept labels for the mirrored board — spatial concepts differ.
-        for state, policy, value, concepts, board_copy in samples:
-            buf.push(state, policy, value, concepts)
-            ms, mp, mv = mirror_sample(state, policy, value)
-            mirrored_concepts = compute_concept_labels(
-                board_copy.transform(chess.flip_horizontal)
-            )
-            buf.push(ms, mp, mv, mirrored_concepts)
+            # Push pre-processed samples (mirroring done in worker, no Board objects)
+            for processed_samples, _, _ in round_results:
+                for sample in processed_samples:
+                    buf.push(*sample)
 
-        # Gradient updates — accumulate split losses across steps for logging
-        last_losses = None
-        with M.model_lock:
-            for _ in range(TRAIN_STEPS):
-                l = az_update(net, buf, opt, M.scheduler)
-                if l is not None:
-                    last_losses = l
+            # Gradient updates
+            last_losses = None
+            with M.model_lock:
+                net.train()
+                for _ in range(TRAIN_STEPS):
+                    l = az_update(net, buf, opt, M.scheduler)
+                    if l is not None:
+                        last_losses = l
+                net.eval()
 
-        M.total_games    = game_n
-        M.selfplay_games += 1
+            M.total_games    = game_n + N_WORKERS - 1
+            M.selfplay_games += N_WORKERS
 
-        if game_n % REPORT_EVERY == 0:
-            elapsed = time.time() - t_game_start
-            gph = REPORT_EVERY / elapsed * 3600
-            if last_losses:
-                total, pol, val, con = last_losses
-                loss_str = f"{total:.3f} (p:{pol:.3f} v:{val:.3f} c:{con:.3f})"
-            else:
-                loss_str = "—"
-            print(f"  {game_n:>8,}  {result:>6}  {n_moves:>5}  "
-                  f"{loss_str:<36}  {len(buf):>8,}  {M.ai_elo:>6.0f}"
-                  f"  ({gph:.1f}/hr)")
-            t_game_start = time.time()
+            if M.total_games % REPORT_EVERY < N_WORKERS:
+                elapsed = time.time() - t_round_start
+                gph = (REPORT_EVERY / elapsed) * 3600
+                # Show summary of round results (W/B/D counts, avg moves)
+                outcomes = [r[1] for r in round_results]
+                avg_mv   = sum(r[2] for r in round_results) // N_WORKERS
+                res_str  = "/".join(outcomes)
+                if last_losses:
+                    total, pol, val, con = last_losses
+                    loss_str = f"{total:.3f} (p:{pol:.3f} v:{val:.3f} c:{con:.3f})"
+                else:
+                    loss_str = "—"
+                print(f"  {M.total_games:>8,}  {res_str:>6}  {avg_mv:>5}  "
+                      f"{loss_str:<36}  {len(buf):>8,}  {M.ai_elo:>6.0f}"
+                      f"  ({gph:.1f}/hr)")
+                t_round_start = time.time()
 
-        if game_n % SAVE_EVERY == 0:
-            save_checkpoint()
+            if M.total_games % SAVE_EVERY < N_WORKERS:
+                save_checkpoint()
+
+            game_n += N_WORKERS
 
     print("  " + "─" * 82)
     print(f"\n  Total games: {M.total_games:,}  |  Elo: {M.ai_elo:.0f}")
@@ -350,4 +404,5 @@ def train():
 
 # ── Entry point ────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    _mp.set_start_method("spawn", force=True)
     train()
