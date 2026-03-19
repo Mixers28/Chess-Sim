@@ -272,7 +272,7 @@ async def get_eval():
     state_t = torch.tensor(encode(board_copy), dtype=torch.float32) \
                    .unsqueeze(0).to(M.device)
     with torch.no_grad(), M.model_lock:
-        _, value_t = M.policy_net(state_t)
+        _, value_t, _ = M.policy_net(state_t)
 
     value = value_t.item()
     # value head is from current player's perspective; convert to White's perspective
