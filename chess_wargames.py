@@ -34,7 +34,8 @@ TOTAL_GAMES  = 10_000
 REPORT_EVERY = 10         # games between CLI status lines
 BATCH_SIZE   = 512
 TRAIN_STEPS  = 5          # gradient steps after each game
-MCTS_SIMS    = 50         # simulations per move during self-play
+MCTS_SIMS    = 100        # simulations per move during self-play
+MCTS_BATCH   = 64         # leaf nodes evaluated per GPU forward pass
 MAX_MOVES    = 60         # half-moves per game cap
 MATERIAL_WIN = 6          # material advantage (in pawns) treated as decisive win
 SAVE_EVERY   = 50         # games between checkpoint saves
@@ -47,7 +48,7 @@ TEMP_DECAY   = 20.0
 # Won't trigger until the value head learns to produce values near ±1.
 RESIGN_THRESHOLD   = -0.70
 RESIGN_CONSECUTIVE = 3
-N_WORKERS          = 4 if torch.cuda.is_available() else 1  # parallel self-play workers
+N_WORKERS          = 8 if torch.cuda.is_available() else 1  # parallel self-play workers
 
 
 # ── Opening book ───────────────────────────────────────────────────────
@@ -286,7 +287,7 @@ def _worker_init(az_channels, az_res_blocks):
     _w_dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _w_net = AlphaZeroNet(az_channels, az_res_blocks).to(_w_dev)
     _w_net.eval()
-    _w_mcts = MCTS(_w_net, _w_dev, n_sims=MCTS_SIMS)
+    _w_mcts = MCTS(_w_net, _w_dev, n_sims=MCTS_SIMS, batch_size=MCTS_BATCH)
 
 
 def _play_game(state_dict_cpu):

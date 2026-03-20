@@ -36,7 +36,7 @@ from pydantic import BaseModel
 
 import chess_model as M
 from chess_model import load_checkpoint, save_checkpoint
-from chess_env import encode, idx_to_move, move_to_idx, legal_mask, mirror_sample, ACTION_SIZE, compute_concept_labels, narrate_concepts
+from chess_env import encode, idx_to_move, move_to_idx, legal_mask, mirror_sample, ACTION_SIZE, compute_concept_labels
 from chess_mcts import MCTS
 from chess_wargames import az_update, selfplay_game, RESIGN_THRESHOLD
 
@@ -55,6 +55,9 @@ _sp_lock        = threading.Lock()
 
 
 # ── Human game state ──────────────────────────────────────────────────
+GAME_INACTIVITY_TIMEOUT = 120   # seconds before an orphaned game is auto-abandoned
+
+
 class HumanGame:
     def __init__(self):
         self.reset()
@@ -69,6 +72,7 @@ class HumanGame:
         self.mcts_root        = None  # reuse MCTS tree between moves
         self.n_sims           = MCTS_SIMS_HUMAN  # difficulty (sims per move)
         self.player_id        = None  # ID of the player currently in this game slot
+        self.last_activity    = time.time()  # updated on each move; used for timeout
 
 
 current_game = HumanGame()
@@ -364,11 +368,21 @@ async def new_game(sims: int = Query(default=None)):
     player_id = str(uuid.uuid4())[:8]
     with game_lock:
         if current_game.active:
-            # A game is in progress — add this player to the queue
-            with _queue_lock:
-                _game_queue.append({"player_id": player_id, "n_sims": sims})
-                position = len(_game_queue)
-            return {"status": "queued", "player_id": player_id, "position": position}
+            stale = time.time() - current_game.last_activity > GAME_INACTIVITY_TIMEOUT
+            if stale:
+                # Orphaned game — abandon it and clear any stale queue entries
+                print(f"[queue] Stale game for {current_game.player_id} — force-replacing")
+                current_game.active  = False
+                current_game.outcome = "abandoned"
+                M.human_game_active.clear()
+                with _queue_lock:
+                    _game_queue.clear()
+            else:
+                # Active game in progress — queue this player
+                with _queue_lock:
+                    _game_queue.append({"player_id": player_id, "n_sims": sims})
+                    position = len(_game_queue)
+                return {"status": "queued", "player_id": player_id, "position": position}
         current_game.reset()
         current_game.active    = True
         current_game.player_id = player_id
@@ -382,10 +396,21 @@ async def new_game(sims: int = Query(default=None)):
 @app.get("/api/queue-status")
 async def queue_status(player_id: str):
     """Poll this while queued. Returns 'your_turn' when it's time to play."""
+    timed_out = False
     with game_lock:
         if current_game.active and current_game.player_id == player_id:
             return {"status": "your_turn", "fen": current_game.board.fen(),
                     "n_sims": current_game.n_sims}
+        # Auto-abandon orphaned games that have had no activity for too long
+        if (current_game.active
+                and time.time() - current_game.last_activity > GAME_INACTIVITY_TIMEOUT):
+            print(f"[queue] Game for player {current_game.player_id} timed out — abandoning")
+            current_game.active  = False
+            current_game.outcome = "abandoned"
+            M.human_game_active.clear()
+            timed_out = True
+    if timed_out:
+        _dequeue_next()
     with _queue_lock:
         for i, entry in enumerate(_game_queue):
             if entry["player_id"] == player_id:
@@ -447,6 +472,7 @@ async def human_move(req: MoveRequest):
 
         current_game.board.push(mv)
         current_game.move_history.append(mv.uci())
+        current_game.last_activity = time.time()
 
         if current_game.board.is_game_over():
             _finalize_human_game()
@@ -492,7 +518,8 @@ async def ai_move():
             board_snapshot, temperature=0, root=prev_root
         )
 
-    pv = mcts.get_pv(new_root, board_snapshot)
+    pv          = mcts.get_pv(new_root, board_snapshot)
+    explanation = mcts.explain_move_v2(new_root, board_snapshot, action)
 
     # Resign if position is hopeless (root Q is from AI/Black's perspective)
     # Only resign if there have been enough moves to form a meaningful position
@@ -520,7 +547,6 @@ async def ai_move():
             raise HTTPException(500, "AI selected an illegal move.")
 
         concepts = compute_concept_labels(board_snapshot)
-        reasoning = narrate_concepts(concepts)
         current_game.traj_b.append((state, policy, concepts,
                                     board_snapshot.copy(stack=False)))
 
@@ -529,17 +555,20 @@ async def ai_move():
 
         current_game.board.push(mv)
         current_game.move_history.append(mv.uci())
+        current_game.last_activity = time.time()
 
         if current_game.board.is_game_over():
             _finalize_human_game()
             return {"move": mv.uci(), "status": "game_over",
                     "outcome": current_game.outcome,
                     "fen": current_game.board.fen(), "pv": pv,
-                    "reasoning": reasoning}
+                    "reasoning":  explanation["reasoning"],
+                    "candidates": explanation["candidates"]}
 
         return {"move": mv.uci(), "status": "ok",
                 "fen": current_game.board.fen(), "pv": pv,
-                "reasoning": reasoning}
+                "reasoning":  explanation["reasoning"],
+                "candidates": explanation["candidates"]}
 
 
 # ── Entry point ───────────────────────────────────────────────────────

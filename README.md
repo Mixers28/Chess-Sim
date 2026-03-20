@@ -2,44 +2,51 @@
 
 An AlphaZero-style chess engine with a web UI. Play against the AI in your browser while it continuously learns from self-play in the background.
 
+The longer-term goal is transfer learning: use the trained chess trunk as a feature extractor for logistics offer ranking (see `PHASE2_LOGISTICS.md`).
+
 ## How it works
 
-The AI uses the same approach as DeepMind's AlphaZero:
-
-- **Neural network** — a deep residual network (20 res blocks, 256 channels) with a policy head (move probabilities) and a value head (position evaluation).
-- **MCTS** — Monte Carlo Tree Search guides move selection using the network's policy and value outputs. UCB exploration balances exploitation vs. discovery.
-- **Self-play** — the engine continuously plays itself in a background thread, generating training data and updating the network via gradient descent.
-- **Online learning** — human games are also used as training data; the network improves as you play against it.
-- **Elo tracking** — the AI's rating is updated after every human game using standard Elo formula.
+- **Neural network** — 192-channel, 10-block SE-ResNet with three heads: policy (move probabilities), value (position evaluation), and concept (6 interpretable chess concepts).
+- **MCTS** — batched virtual-loss Monte Carlo Tree Search. Multiple simulations run in parallel, all leaf evaluations are batched into one GPU forward pass, then backed up together (~6× faster than sequential).
+- **Self-play** — the engine plays itself continuously in a background thread, generating training data and updating via gradient descent.
+- **Concept bottleneck** — an auxiliary head predicts 6 chess concepts (material balance, king safety, piece mobility, pawn structure, space control, tactical threat) from fixed trunk features. Used to generate search-grounded move explanations.
+- **Move explanations** — after each AI move, the top 3 MCTS candidates are compared by Q-value, visit share, and concept deltas. A deterministic sentence explains why the chosen move was preferred.
+- **Elo tracking** — the AI's rating is updated after every human game using the standard Elo formula.
 
 ## Project structure
 
 ```
-app.py              FastAPI web server — routes, game state, self-play thread
-chess_model.py      Shared singleton: network, optimizer, replay buffer, Elo, checkpointing
-chess_net.py        AlphaZeroNet architecture (ResBlock tower + policy/value heads)
-chess_mcts.py       Monte Carlo Tree Search implementation
-chess_env.py        Board encoding (13x8x8), move indexing, legal move masks
-chess_wargames.py   Self-play loop, AlphaZero training update (az_update)
-wargames.py         Standalone CLI training script
-static/index.html   Web UI
-checkpoint/         Saved model weights and training state
+app.py               FastAPI web server — routes, game state, self-play thread, queue
+chess_model.py       Shared singleton: network, optimizer, replay buffer, Elo, checkpointing
+chess_net.py         AlphaZeroNet architecture (SE-ResBlock tower + policy/value/concept heads)
+chess_mcts.py        Batched virtual-loss MCTS + explain_move_v2 (search-grounded explanation)
+chess_env.py         Board encoding (19×8×8), move indexing, legal move masks, concept labels
+chess_wargames.py    Self-play loop, az_update(), data augmentation (mirror)
+pretrain_pgn.py      Supervised pre-training on elite PGN games before self-play
+static/index.html    Web UI — board, candidates table, reasoning card, Elo chart
+Dockerfile           CPU-only container for Coolify deployment
+PHASE2_LOGISTICS.md  Research plan: chess trunk → logistics offer ranking transfer learning
 ```
 
 ## Requirements
 
-- Python 3.10+
-- PyTorch
-- FastAPI + Uvicorn
-- python-chess
+Python 3.10+, PyTorch, FastAPI, Uvicorn, python-chess, numpy, pydantic.
 
-Install dependencies:
+**GPU install (recommended):**
 
 ```bash
-pip install torch fastapi uvicorn python-chess numpy pydantic
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+pip install fastapi uvicorn python-chess numpy pydantic
 ```
 
-GPU is strongly recommended. On CPU, MCTS is ~1.2s/simulation, making response times slow.
+**CPU install:**
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install fastapi uvicorn python-chess numpy pydantic
+```
+
+Virtual env is at `./venv/` — activate with `source venv/bin/activate`.
 
 ## Running
 
@@ -49,20 +56,80 @@ GPU is strongly recommended. On CPU, MCTS is ~1.2s/simulation, making response t
 python app.py
 ```
 
-Then open [http://localhost:8000](http://localhost:8000) in your browser. You play as White, the AI plays as Black.
+Open `http://localhost:8000`. You play as White; the AI plays as Black.
 
-The server automatically:
-- Loads the latest checkpoint on startup
-- Runs self-play in the background to keep training
-- Saves a checkpoint every 50 self-play games or every 10 human games
+On startup the server loads the latest checkpoint, runs self-play in the background, and saves checkpoints every 50 self-play games or every 10 human games.
 
-### Standalone training (no web UI)
+### Standalone self-play training (no web UI)
 
 ```bash
 python chess_wargames.py
 ```
 
-Runs 10,000 self-play games with CLI progress output and saves checkpoints every 50 games.
+Runs self-play with CLI progress output, saves checkpoints every 50 games.
+
+### Pre-training on PGN games
+
+Run once after changing `AZ_CHANNELS` or starting fresh. Requires an elite PGN file (e.g. Lichess elite database).
+
+```bash
+python pretrain_pgn.py --pgn lichess_elite_2025-11.pgn --games 200000
+```
+
+Then start self-play: `python chess_wargames.py`
+
+## Checkpoints
+
+Saved to `checkpoint/` (excluded from git):
+
+| File | Contents | Scope |
+|------|----------|-------|
+| `model.pt` | weights, optimizer, scheduler | shared across machines |
+| `stats.pt` | Elo, game counts | per-machine |
+| `replay_buffer.npz` | up to 20k seed samples | per-machine |
+
+To sync `model.pt` to a remote Coolify server after each save:
+
+```bash
+export SYNC_MODEL_TARGET=user@host:/path/checkpoint/model.pt
+export SYNC_MODEL_PORT=22   # optional, default 22
+```
+
+## Docker deployment
+
+```bash
+docker build -t chess-sim .
+docker run -p 8000:8000 -v ./checkpoint:/app/checkpoint chess-sim
+```
+
+The image uses CPU-only PyTorch to keep image size manageable. Bind-mount `checkpoint/` so weights persist across container restarts.
+
+## Board encoding
+
+19-plane `(19, 8, 8)` float32 tensor:
+
+| Planes | Content |
+|--------|---------|
+| 0–5 | White pieces (P N B R Q K) |
+| 6–11 | Black pieces (P N B R Q K) |
+| 12 | Side to move |
+| 13–16 | Castling rights |
+| 17 | En passant square |
+| 18 | Repetition flag |
+
+Move indexing: `from_sq * 64 + to_sq` (0–4095). Knight underpromotions use indices 4096–8191.
+
+## Key constants
+
+| Constant | Value | Location |
+|----------|-------|----------|
+| `AZ_CHANNELS` | 192 | `chess_model.py` |
+| `AZ_RES_BLOCKS` | 10 | `chess_model.py` |
+| `REPLAY_CAPACITY` | 100,000 | `chess_model.py` |
+| `MCTS_SIMS_SP` | 100 | `app.py` |
+| `MCTS_SIMS_HUMAN` | 50 (GPU) / 10 (CPU) | `app.py` |
+| `MAX_MOVES` | 80 | `chess_wargames.py` |
+| `RESIGN_THRESHOLD` | −0.9 | `chess_wargames.py` |
 
 ## API endpoints
 
@@ -71,30 +138,30 @@ Runs 10,000 self-play games with CLI progress output and saves checkpoints every
 | GET | `/` | Serve web UI |
 | GET | `/api/state` | Current board state (FEN, legal moves, outcome) |
 | GET | `/api/stats` | AI Elo, game counts, replay buffer size, device |
-| POST | `/api/new-game` | Start a new human vs AI game |
+| GET | `/api/eval` | Current position value from the network |
+| GET | `/api/elo-history` | Elo over time for chart rendering |
+| POST | `/api/new-game` | Start a new human vs AI game (queued if server busy) |
 | POST | `/api/move` | Submit a human move (UCI format) |
-| GET | `/api/ai-move` | Request the AI's move |
+| GET | `/api/ai-move` | Request the AI's move + candidates + reasoning |
+| POST | `/api/resign` | Cleanly terminate game (no Elo effect) |
+| GET | `/api/selfplay-stream` | SSE stream of live self-play board positions |
 
-## Board encoding
+## Roadmap
 
-The board is encoded as a `13 x 8 x 8` float32 tensor:
+**Phase 1 — Chess (in progress)**
+- [x] SE-ResNet 192ch / 10-block with policy, value, concept heads
+- [x] Batched virtual-loss MCTS
+- [x] PGN pre-training + self-play
+- [x] Search-grounded move explanations (Reasoning v2)
+- [ ] Session integrity — bind moves/resign to player_id
+- [ ] Benchmark harness — win rate vs random, heuristic, Stockfish at low depth
+- [ ] Promotion type support (all four pieces, not just queen)
+- [ ] Move encoding tests
 
-- Planes 0–5: white pieces (P N B R Q K)
-- Planes 6–11: black pieces (P N B R Q K)
-- Plane 12: side to move (1.0 = white, 0.0 = black)
+**Phase 2 — Logistics transfer learning**
+- [ ] LogisticsInputAdapter: offer features → 256×8×8 latent
+- [ ] Freeze chess trunk, train logistics heads on public datasets (Cargo 2000, DataCo)
+- [ ] Compare: XGBoost baseline, MLP scratch, frozen trunk, fine-tuned trunk, trunk + concept supervision
+- [ ] Evaluate on time:matters internal offer data (Phase 2b)
 
-Moves are encoded as integers `0–4095` (`from_square * 64 + to_square`). Promotions are always to queen.
-
-## Configuration
-
-Key constants in `chess_model.py` and `app.py`:
-
-| Constant | Default | Description |
-|----------|---------|-------------|
-| `AZ_CHANNELS` | 256 | Network width |
-| `AZ_RES_BLOCKS` | 20 | Residual tower depth |
-| `REPLAY_CAPACITY` | 200,000 | Max replay buffer size |
-| `LR` | 1e-3 | Adam learning rate |
-| `MCTS_SIMS_SP` | 100 | Simulations per move (self-play) |
-| `MCTS_SIMS_HUMAN` | 50 (GPU) / 10 (CPU) | Simulations per move (vs human) |
-| `TRAIN_STEPS` | 5 | Gradient steps after each game |
+See `PHASE2_LOGISTICS.md` for the full experiment design.

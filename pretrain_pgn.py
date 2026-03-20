@@ -81,7 +81,7 @@ def stream_batches(pgn_path: str, max_games: int, batch_size: int):
                 if i >= MAX_MOVE:
                     break
                 if i in selected:
-                    action = move_to_idx(move, board)
+                    action = move_to_idx(move)
                     if action is not None:
                         buf_s.append(encode(board))
                         buf_a.append(action)
@@ -139,7 +139,7 @@ def pretrain(pgn_path: str, max_games: int, batch_size: int, epochs: int) -> Non
             p_pred, v_pred, c_pred = net(s_t)
 
             p_loss = -(p_t * F.log_softmax(p_pred, dim=1)).sum(dim=1).mean()
-            v_loss = F.mse_loss(v_pred.squeeze(1), v_t)
+            v_loss = F.mse_loss(v_pred, v_t)
             c_loss = F.mse_loss(c_pred, c_t)
             loss   = p_loss + 0.5 * v_loss + 0.1 * c_loss
 

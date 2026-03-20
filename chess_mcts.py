@@ -23,7 +23,68 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from chess_env import encode, idx_to_move, legal_mask, ACTION_SIZE, CONCEPT_NAMES
+from chess_env import (encode, idx_to_move, legal_mask, ACTION_SIZE,
+                       CONCEPT_NAMES, compute_concept_labels)
+
+
+# ── Reasoning v2: phrase mapping and sentence builder ─────────────────────────
+# Maps concept names → (positive phrase, negative phrase)
+_CONCEPT_PHRASES = {
+    "material_balance": ("preserves material balance", "loses material balance"),
+    "king_safety":      ("improves king safety",       "weakens king safety"),
+    "piece_mobility":   ("keeps better activity",      "reduces activity"),
+    "pawn_structure":   ("maintains pawn structure",   "weakens pawn structure"),
+    "space_control":    ("gains more space",            "cedes space"),
+    "tactical_threat":  ("maintains tactical pressure", "reduces tactical pressure"),
+}
+
+
+def _build_reasoning(chosen: dict, candidates: list) -> str:
+    """
+    Layer C: convert Layer A (search) + Layer B (concept deltas) into one sentence.
+
+    Scoring rule per concept:
+        score = alignment_boost × (
+                    1.5 × ΔQ  +  1.0 × Δvisit_share
+                  + 0.8 × Δheuristic_delta  +  0.4 × Δmodel_delta
+                )
+
+    alignment_boost = 1.3 when heuristic and model concept deltas agree (same sign).
+    Only mention concepts where the heuristic delta margin > 0.03.
+    Falls back to visit-share comparison when no concept advantages are found.
+    """
+    if not chosen:
+        return ""
+    others = [c for c in candidates if c["uci"] != chosen["uci"]]
+    if not others:
+        return f"Played {chosen['uci']}."
+
+    runner_up  = others[0]
+    q_diff     = chosen["Q"]           - runner_up["Q"]
+    vs_diff    = chosen["visit_share"] - runner_up["visit_share"]
+    chosen_pct = round(chosen["visit_share"] * 100)
+    runner_pct = round(runner_up["visit_share"] * 100)
+    alt_names  = [c["uci"] for c in others[:2]]
+    alts_str   = " and ".join(alt_names)
+
+    scored = []
+    for concept, (pos_phrase, _) in _CONCEPT_PHRASES.items():
+        h_diff = (chosen["concept_delta"].get(concept, 0.0)
+                  - runner_up["concept_delta"].get(concept, 0.0))
+        m_diff = (chosen.get("model_concept_delta", {}).get(concept, 0.0)
+                  - runner_up.get("model_concept_delta", {}).get(concept, 0.0))
+        if h_diff > 0.03:
+            alignment = 1.3 if m_diff > 0 else 1.0
+            score = alignment * (1.5 * q_diff + 1.0 * vs_diff + 0.8 * h_diff + 0.4 * m_diff)
+            scored.append((score, pos_phrase))
+
+    scored.sort(reverse=True)
+    phrases = [phrase for _, phrase in scored[:2]]
+
+    if phrases:
+        return f"Chose {chosen['uci']} over {alts_str} because it {' and '.join(phrases)}."
+    return (f"Chose {chosen['uci']} over {alts_str} — "
+            f"search favoured it ({chosen_pct}% vs {runner_pct}% of visits).")
 
 
 class MCTSNode:
@@ -246,6 +307,134 @@ class MCTS:
             node = node.children[best_a]
 
         return pv
+
+    def _get_pv_from_node(self, node: MCTSNode, board: chess.Board,
+                          depth: int = 5) -> list[str]:
+        """Extract PV starting from an already-advanced board position and node."""
+        pv = []
+        b  = board.copy(stack=False)
+        n  = node
+        for _ in range(depth):
+            if not n.children or b.is_game_over():
+                break
+            best_a = max(n.children, key=lambda a: n.children[a].N)
+            mv = idx_to_move(best_a, b)
+            if mv is None:
+                break
+            pv.append(mv.uci())
+            b.push(mv)
+            n = n.children[best_a]
+        return pv
+
+    @torch.no_grad()
+    def explain_move_v2(self, root: MCTSNode, board: chess.Board,
+                        chosen_action: int, top_k: int = 3) -> dict:
+        """
+        Reasoning v2: search-grounded, candidate-comparative explanation.
+
+        Phase 2: heuristic concept deltas + model concept deltas via one
+        batched forward pass over all candidate boards.
+
+        Returns:
+          chosen_uci  — UCI of the chosen move
+          candidates  — list of dicts (Layer A + Layer B):
+                        {uci, visits, visit_share, Q, prior,
+                         concept_delta, model_concept_delta, pv}
+          reasoning   — one-sentence Layer C summary
+        """
+        total_visits    = max(sum(c.N for c in root.children.values()), 1)
+        before_concepts = compute_concept_labels(board)
+
+        top_children = sorted(
+            root.children.items(), key=lambda x: x[1].N, reverse=True
+        )[:top_k]
+
+        # ── Collect all boards for a single batched forward pass ───────
+        boards_to_eval  = [board]
+        candidate_items = []   # (action, child, mv, b_after)
+
+        for action, child in top_children:
+            mv = idx_to_move(action, board)
+            if mv is None:
+                continue
+            b_after = board.copy(stack=False)
+            b_after.push(mv)
+            boards_to_eval.append(b_after)
+            candidate_items.append((action, child, mv, b_after))
+
+        # Handle chosen not in top_k (e.g. temperature sampling)
+        chosen_in_top = any(a == chosen_action for a, _, _, _ in candidate_items)
+        chosen_extra  = None
+        if not chosen_in_top and chosen_action in root.children:
+            mv = idx_to_move(chosen_action, board)
+            if mv is not None:
+                b_after = board.copy(stack=False)
+                b_after.push(mv)
+                chosen_extra = (chosen_action, root.children[chosen_action], mv, b_after)
+                boards_to_eval.append(b_after)
+
+        # ── Single batched forward pass ────────────────────────────────
+        states          = np.stack([encode(b) for b in boards_to_eval]).astype(np.float32)
+        state_t         = torch.tensor(states, dtype=torch.float32).to(self.device)
+        _, _, concepts_t = self.net(state_t)
+        model_concepts  = concepts_t.cpu().numpy()   # (N_boards, N_CONCEPTS)
+        model_before    = model_concepts[0]
+
+        # ── Build candidates ───────────────────────────────────────────
+        candidates  = []
+        chosen_cand = None
+
+        for i, (action, child, mv, b_after) in enumerate(candidate_items):
+            h_delta = compute_concept_labels(b_after) - before_concepts
+            m_delta = model_concepts[i + 1] - model_before
+
+            cand = {
+                "uci":          mv.uci(),
+                "visits":       child.N,
+                "visit_share":  round(child.N / total_visits, 3),
+                "Q":            round(child.Q, 3),
+                "prior":        round(child.P, 3),
+                "concept_delta": {
+                    name: round(float(d), 3)
+                    for name, d in zip(CONCEPT_NAMES, h_delta)
+                },
+                "model_concept_delta": {
+                    name: round(float(d), 3)
+                    for name, d in zip(CONCEPT_NAMES, m_delta)
+                },
+                "pv": self._get_pv_from_node(child, b_after),
+            }
+            candidates.append(cand)
+            if action == chosen_action:
+                chosen_cand = cand
+
+        if chosen_cand is None and chosen_extra is not None:
+            action, child, mv, b_after = chosen_extra
+            h_delta = compute_concept_labels(b_after) - before_concepts
+            m_delta = model_concepts[len(candidate_items) + 1] - model_before
+            chosen_cand = {
+                "uci":          mv.uci(),
+                "visits":       child.N,
+                "visit_share":  round(child.N / total_visits, 3),
+                "Q":            round(child.Q, 3),
+                "prior":        round(child.P, 3),
+                "concept_delta": {
+                    name: round(float(d), 3)
+                    for name, d in zip(CONCEPT_NAMES, h_delta)
+                },
+                "model_concept_delta": {
+                    name: round(float(d), 3)
+                    for name, d in zip(CONCEPT_NAMES, m_delta)
+                },
+                "pv": self._get_pv_from_node(child, b_after),
+            }
+            candidates.insert(0, chosen_cand)
+
+        return {
+            "chosen_uci": chosen_cand["uci"] if chosen_cand else "",
+            "candidates": candidates,
+            "reasoning":  _build_reasoning(chosen_cand, candidates),
+        }
 
     @torch.no_grad()
     def explain_move(self, root: MCTSNode, board: chess.Board) -> dict:

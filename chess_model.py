@@ -30,7 +30,7 @@ from chess_env import INPUT_PLANES
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ── Network config ────────────────────────────────────────────────────
-AZ_CHANNELS  = 128
+AZ_CHANNELS  = 192
 AZ_RES_BLOCKS = 10
 
 # ── Hyperparameters ───────────────────────────────────────────────────

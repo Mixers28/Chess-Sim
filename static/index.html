@@ -145,13 +145,34 @@
     #status.lose     { color: #f44336; font-weight: bold; }
     #status.draw     { color: #888;    font-weight: bold; }
 
-    /* PV */
-    #pv-line {
-      font-size: 0.75rem;
-      color: #666;
-      min-height: 1.2em;
-      word-break: break-all;
+    /* Candidates table */
+    .cand-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.73rem;
     }
+    .cand-table th {
+      color: #444;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      font-size: 0.59rem;
+      text-align: left;
+      padding: 0 4px 6px 0;
+      border-bottom: 1px solid #1e1e1e;
+    }
+    .cand-table td {
+      padding: 5px 4px 5px 0;
+      border-bottom: 1px solid #161616;
+      vertical-align: middle;
+    }
+    .cand-table tr:last-child td { border-bottom: none; }
+    .cand-move { font-weight: bold; color: #888; font-family: 'Courier New', monospace; }
+    .cand-chosen .cand-move { color: #fff; }
+    .cand-q-pos { color: #4caf50; }
+    .cand-q-neg { color: #f44336; }
+    .cand-concept { font-size: 0.65rem; }
+    .cand-concept-pos { color: #4caf50; }
+    .cand-concept-neg { color: #f44336; }
 
     /* Move history */
     #move-list {
@@ -366,8 +387,20 @@
       </div>
 
       <div class="card">
-        <h3>AI considers</h3>
-        <div id="pv-line">—</div>
+        <h3>AI candidates</h3>
+        <table class="cand-table">
+          <thead>
+            <tr>
+              <th>Move</th>
+              <th>Visits</th>
+              <th>Q</th>
+              <th>Top concept</th>
+            </tr>
+          </thead>
+          <tbody id="cand-table-body">
+            <tr><td colspan="4" style="color:#333;text-align:center;padding:8px 0">—</td></tr>
+          </tbody>
+        </table>
       </div>
 
       <div class="card">
@@ -550,7 +583,7 @@ async function onDrop(source, target) {
     }
 
     updateMoveHistory();
-    updatePV(aiResp.pv || []);
+    updateCandidates(aiResp.candidates || [], aiResp.move || '');
     updateReasoning(aiResp.reasoning || '');
     refreshEval();
 
@@ -615,7 +648,7 @@ function startGame(fen, n_sims) {
   active = true;
   busy   = false;
   document.getElementById('move-list').innerHTML = '';
-  updatePV([]);
+  updateCandidates([], '');
   updateReasoning('');
   updateEvalBar(0);
   setStatus('Your turn (White)');
@@ -692,9 +725,49 @@ function updateMoveHistory() {
   el.scrollTop = el.scrollHeight;
 }
 
-// ── PV display ────────────────────────────────────────────────────
-function updatePV(pv) {
-  document.getElementById('pv-line').textContent = pv.length ? pv.join(' ') : '—';
+// ── Candidates table ──────────────────────────────────────────────
+const CONCEPT_SHORT = {
+  material_balance: 'material',
+  king_safety:      'king safety',
+  piece_mobility:   'activity',
+  pawn_structure:   'pawns',
+  space_control:    'space',
+  tactical_threat:  'tactics',
+};
+
+function updateCandidates(candidates, chosenUci) {
+  const el = document.getElementById('cand-table-body');
+  if (!candidates || candidates.length === 0) {
+    el.innerHTML = '<tr><td colspan="4" style="color:#333;text-align:center;padding:8px 0">—</td></tr>';
+    return;
+  }
+  el.innerHTML = candidates.map(c => {
+    const isChosen = c.uci === chosenUci;
+    const qCls = c.Q >= 0 ? 'cand-q-pos' : 'cand-q-neg';
+    const qStr = (c.Q >= 0 ? '+' : '') + c.Q.toFixed(2);
+    const pct  = Math.round(c.visit_share * 100) + '%';
+
+    // Find highest-magnitude heuristic concept delta
+    let topConcept = '';
+    if (c.concept_delta) {
+      const entries = Object.entries(c.concept_delta)
+        .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+      if (entries.length && Math.abs(entries[0][1]) > 0.01) {
+        const [name, val] = entries[0];
+        const sign = val > 0 ? '+' : '';
+        const cls  = val > 0 ? 'cand-concept-pos' : 'cand-concept-neg';
+        topConcept = `<span class="cand-concept ${cls}">${sign}${CONCEPT_SHORT[name] || name}</span>`;
+      }
+    }
+
+    const rowCls = isChosen ? 'cand-chosen' : '';
+    return `<tr class="${rowCls}">
+      <td class="cand-move">${c.uci}</td>
+      <td>${pct}</td>
+      <td class="${qCls}">${qStr}</td>
+      <td>${topConcept}</td>
+    </tr>`;
+  }).join('');
 }
 
 function updateReasoning(text) {
