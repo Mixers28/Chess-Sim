@@ -551,7 +551,7 @@ async function onDrop(source, target) {
 
   try {
     const uciStr = move.from + move.to + (move.promotion || '');
-    const resp   = await api('POST', '/api/move', { move: uciStr });
+    const resp   = await api('POST', '/api/move', { move: uciStr, player_id: myPlayerId });
 
     if (resp.status === 'game_over') {
       board.position(resp.fen);
@@ -565,7 +565,7 @@ async function onDrop(source, target) {
     const gpuNote = stats.device === 'cpu' ? ' (~slow on CPU)' : '';
     setStatus(`AI thinking…${gpuNote}`, 'thinking');
 
-    const aiResp = await api('GET', '/api/ai-move');
+    const aiResp = await api('GET', `/api/ai-move?player_id=${myPlayerId}`);
 
     if (aiResp.status === 'resigned') {
       setStatus('Game ended.', 'draw');
@@ -655,6 +655,9 @@ function startGame(fen, n_sims) {
 }
 
 async function cancelQueue() {
+  if (myPlayerId) {
+    try { await api('POST', `/api/cancel-queue?player_id=${myPlayerId}`); } catch (_) {}
+  }
   hideQueue();
   myPlayerId = null;
   setStatus('Press New Game to play.');
@@ -686,7 +689,7 @@ document.getElementById('btn-new').addEventListener('click', async () => {
 document.getElementById('btn-resign').addEventListener('click', async () => {
   if (!active) return;
   try {
-    await api('POST', '/api/resign');
+    await api('POST', `/api/resign?player_id=${myPlayerId}`);
     active = false;
     busy   = false;
     setStatus('Game resigned.', 'draw');

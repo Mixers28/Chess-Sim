@@ -56,6 +56,7 @@ _sp_lock        = threading.Lock()
 
 # ── Human game state ──────────────────────────────────────────────────
 GAME_INACTIVITY_TIMEOUT = 120   # seconds before an orphaned game is auto-abandoned
+QUEUE_EXPIRY_TIMEOUT    = 300   # seconds before a queued player is silently dropped
 
 
 class HumanGame:
@@ -85,11 +86,21 @@ _queue_lock = threading.Lock()
 
 
 def _dequeue_next() -> None:
-    """Start the next queued game if anyone is waiting. Call after a game ends."""
+    """Start the next non-expired queued game. Call after a game ends."""
+    now = time.time()
+    entry = None
     with _queue_lock:
-        if not _game_queue:
-            return
-        entry = _game_queue.pop(0)
+        while _game_queue:
+            candidate = _game_queue[0]
+            age = now - candidate.get("queued_at", now)
+            if age > QUEUE_EXPIRY_TIMEOUT:
+                print(f"[queue] Expired entry for {candidate['player_id']} ({age:.0f}s old)")
+                _game_queue.pop(0)
+                continue
+            entry = _game_queue.pop(0)
+            break
+    if entry is None:
+        return
     with game_lock:
         current_game.reset()
         current_game.active    = True
@@ -380,7 +391,8 @@ async def new_game(sims: int = Query(default=None)):
             else:
                 # Active game in progress — queue this player
                 with _queue_lock:
-                    _game_queue.append({"player_id": player_id, "n_sims": sims})
+                    _game_queue.append({"player_id": player_id, "n_sims": sims,
+                                        "queued_at": time.time()})
                     position = len(_game_queue)
                 return {"status": "queued", "player_id": player_id, "position": position}
         current_game.reset()
@@ -420,11 +432,13 @@ async def queue_status(player_id: str):
 
 
 @app.post("/api/resign")
-async def resign():
+async def resign(player_id: str = Query(...)):
     """Cleanly terminate the current game without affecting Elo or training."""
     with game_lock:
         if not current_game.active:
             raise HTTPException(400, "No active game.")
+        if player_id != current_game.player_id:
+            raise HTTPException(403, "Resign rejected: wrong player_id.")
         current_game.active  = False
         current_game.outcome = "resigned"
     M.human_game_active.clear()
@@ -432,8 +446,19 @@ async def resign():
     return {"status": "ok", "outcome": "resigned"}
 
 
+@app.post("/api/cancel-queue")
+async def cancel_queue(player_id: str = Query(...)):
+    """Remove a player from the queue (called when they cancel while waiting)."""
+    with _queue_lock:
+        before = len(_game_queue)
+        _game_queue[:] = [e for e in _game_queue if e["player_id"] != player_id]
+        removed = before - len(_game_queue)
+    return {"status": "ok", "removed": removed}
+
+
 class MoveRequest(BaseModel):
-    move: str
+    move:      str
+    player_id: str
 
 
 @app.post("/api/move")
@@ -442,6 +467,8 @@ async def human_move(req: MoveRequest):
     with game_lock:
         if not current_game.active:
             raise HTTPException(400, "No active game.")
+        if req.player_id != current_game.player_id:
+            raise HTTPException(403, "Move rejected: wrong player_id.")
         if current_game.board.turn != chess.WHITE:
             raise HTTPException(400, "Not white's turn.")
         if current_game.outcome is not None:
@@ -483,11 +510,13 @@ async def human_move(req: MoveRequest):
 
 
 @app.get("/api/ai-move")
-async def ai_move():
+async def ai_move(player_id: str = Query(...)):
     """AI (black) calculates and plays its move using MCTS with tree reuse."""
     with game_lock:
         if not current_game.active:
             raise HTTPException(400, "No active game.")
+        if player_id != current_game.player_id:
+            raise HTTPException(403, "AI move rejected: wrong player_id.")
         if current_game.board.turn != chess.BLACK:
             raise HTTPException(400, "Not AI's turn.")
         if current_game.outcome is not None:
