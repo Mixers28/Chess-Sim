@@ -228,6 +228,48 @@
     .dot.active { background: #4caf50; animation: pulse 1.2s infinite; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
 
+    /* Promotion picker */
+    #promo-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.75);
+      z-index: 200;
+      align-items: center;
+      justify-content: center;
+    }
+    #promo-overlay.visible { display: flex; }
+    #promo-picker {
+      background: #111;
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 20px 24px;
+      text-align: center;
+    }
+    #promo-picker p {
+      font-size: 0.75rem;
+      color: #666;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      margin-bottom: 14px;
+    }
+    #promo-picker .promo-btns {
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+    }
+    #promo-picker .promo-btns button {
+      width: 64px;
+      padding: 12px 0;
+      font-size: 1.6rem;
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-radius: 6px;
+      cursor: pointer;
+      margin-top: 0;
+    }
+    #promo-picker .promo-btns button:hover { background: #2a2a2a; border-color: #666; }
+
     /* Queue overlay */
     #queue-overlay {
       display: none;
@@ -478,6 +520,19 @@
 </div>
 
 
+<!-- Promotion picker overlay -->
+<div id="promo-overlay">
+  <div id="promo-picker">
+    <p>Choose promotion</p>
+    <div class="promo-btns">
+      <button data-promo="q" title="Queen">♛</button>
+      <button data-promo="r" title="Rook">♜</button>
+      <button data-promo="b" title="Bishop">♝</button>
+      <button data-promo="n" title="Knight">♞</button>
+    </div>
+  </div>
+</div>
+
 <!-- Queue overlay -->
 <div id="queue-overlay">
   <h2>GAME IN PROGRESS</h2>
@@ -539,18 +594,64 @@ function onDragStart(source, piece) {
   return true;
 }
 
+function _isPawnPromotion(source, target) {
+  const piece = game.get(source);
+  if (!piece || piece.type !== 'p') return false;
+  return (piece.color === 'w' && target[1] === '8') ||
+         (piece.color === 'b' && target[1] === '1');
+}
+
+let _pendingPromo = null;
+
+function _showPromoModal(source, target) {
+  _pendingPromo = { source, target };
+  document.getElementById('promo-overlay').classList.add('visible');
+}
+
+function _hidePromoModal() {
+  document.getElementById('promo-overlay').classList.remove('visible');
+  _pendingPromo = null;
+}
+
+document.querySelectorAll('#promo-picker [data-promo]').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    if (!_pendingPromo) return;
+    const { source, target } = _pendingPromo;
+    const promo = btn.dataset.promo;
+    _hidePromoModal();
+    await _submitMove(source, target, promo);
+  });
+});
+
 async function onDrop(source, target) {
   if (busy || !active) return 'snapback';
 
-  const move = game.move({ from: source, to: target, promotion: 'q' });
-  if (!move) return 'snapback';
+  // Validate move exists (test with queen promotion to check legality)
+  const testPromo = _isPawnPromotion(source, target) ? 'q' : undefined;
+  const testMove  = game.move({ from: source, to: target, promotion: testPromo });
+  if (!testMove) return 'snapback';
+  game.undo();
+
+  // If promotion, show picker and let user choose
+  if (_isPawnPromotion(source, target)) {
+    _showPromoModal(source, target);
+    return 'snapback';  // piece snaps back; modal takes over
+  }
+
+  await _submitMove(source, target, undefined);
+}
+
+async function _submitMove(source, target, promotion) {
+  const move = game.move({ from: source, to: target, promotion: promotion || 'q' });
+  if (!move) return;
 
   busy = true;
   setStatus('Sending move…');
   updateEvalBar(null);
+  board.position(game.fen());
 
   try {
-    const uciStr = move.from + move.to + (move.promotion || '');
+    const uciStr = move.from + move.to + (promotion || '');
     const resp   = await api('POST', '/api/move', { move: uciStr, player_id: myPlayerId });
 
     if (resp.status === 'game_over') {
@@ -568,7 +669,7 @@ async function onDrop(source, target) {
     const aiResp = await api('GET', `/api/ai-move?player_id=${myPlayerId}`);
 
     if (aiResp.status === 'resigned') {
-      setStatus('Game ended.', 'draw');
+      setStatus('AI resigned.', 'win');
       active = false;
       refreshStats();
       return;
@@ -577,7 +678,7 @@ async function onDrop(source, target) {
     if (aiResp.move) {
       const aiFrom = aiResp.move.slice(0, 2);
       const aiTo   = aiResp.move.slice(2, 4);
-      const aiProm = aiResp.move.length > 4 ? aiResp.move[4] : 'q';
+      const aiProm = aiResp.move.length > 4 ? aiResp.move[4] : undefined;
       game.move({ from: aiFrom, to: aiTo, promotion: aiProm });
       board.position(game.fen());
     }
