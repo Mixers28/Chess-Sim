@@ -42,8 +42,9 @@ from chess_wargames import az_update, selfplay_game, RESIGN_THRESHOLD
 
 STATIC_DIR      = os.path.join(os.path.dirname(__file__), "static")
 import torch as _t
-MCTS_SIMS_SP    = 100 if _t.cuda.is_available() else 20   # simulations per move during self-play
-MCTS_SIMS_HUMAN = 50 if _t.cuda.is_available() else 20
+_gpu = _t.cuda.is_available() or _t.backends.mps.is_available()
+MCTS_SIMS_SP    = 100 if _gpu else 20   # simulations per move during self-play
+MCTS_SIMS_HUMAN = 50 if _gpu else 20
 TRAIN_STEPS     = 5     # gradient steps after each game
 SAVE_EVERY_SP   = 50    # self-play games between saves
 MAX_MOVES       = 256
@@ -243,7 +244,7 @@ async def lifespan(app: FastAPI):
     async def _watchdog():
         while not M.shutdown_flag:
             await asyncio.sleep(30)
-            if M.device.type == "cuda" and _sp_thread and not _sp_thread.is_alive() and not M.shutdown_flag:
+            if M.device.type != "cpu" and _sp_thread and not _sp_thread.is_alive() and not M.shutdown_flag:
                 print("[app] Selfplay thread died — restarting", flush=True)
                 _start_selfplay_thread()
 

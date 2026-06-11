@@ -27,7 +27,11 @@ from chess_net import AlphaZeroNet
 from chess_env import INPUT_PLANES
 
 # ── Device ────────────────────────────────────────────────────────────
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device(
+    "cuda" if torch.cuda.is_available()
+    else "mps" if torch.backends.mps.is_available()
+    else "cpu"
+)
 
 # ── Network config ────────────────────────────────────────────────────
 AZ_CHANNELS  = 192
