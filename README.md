@@ -2,8 +2,6 @@
 
 An AlphaZero-style chess engine with a web UI. Play against the AI in your browser while it continuously learns from self-play in the background.
 
-The longer-term goal is transfer learning: use the trained chess trunk as a feature extractor for logistics offer ranking (see `PHASE2_LOGISTICS.md`).
-
 ## How it works
 
 - **Neural network** — 192-channel, 10-block SE-ResNet with three heads: policy (move probabilities), value (position evaluation), and concept (6 interpretable chess concepts).
@@ -25,7 +23,6 @@ chess_wargames.py    Self-play loop, az_update(), data augmentation (mirror)
 pretrain_pgn.py      Supervised pre-training on elite PGN games before self-play
 static/index.html    Web UI — board, candidates table, reasoning card, Elo chart
 Dockerfile           CPU-only container for Coolify deployment
-PHASE2_LOGISTICS.md  Research plan: chess trunk → logistics offer ranking transfer learning
 ```
 
 ## Requirements
@@ -148,20 +145,12 @@ Move indexing: `from_sq * 64 + to_sq` (0–4095). Knight underpromotions use ind
 
 ## Roadmap
 
-**Phase 1 — Chess (in progress)**
 - [x] SE-ResNet 192ch / 10-block with policy, value, concept heads
 - [x] Batched virtual-loss MCTS
 - [x] PGN pre-training + self-play
 - [x] Search-grounded move explanations (Reasoning v2)
-- [ ] Session integrity — bind moves/resign to player_id
-- [ ] Benchmark harness — win rate vs random, heuristic, Stockfish at low depth
-- [ ] Promotion type support (all four pieces, not just queen)
-- [ ] Move encoding tests
-
-**Phase 2 — Logistics transfer learning**
-- [ ] LogisticsInputAdapter: offer features → 256×8×8 latent
-- [ ] Freeze chess trunk, train logistics heads on public datasets (Cargo 2000, DataCo)
-- [ ] Compare: XGBoost baseline, MLP scratch, frozen trunk, fine-tuned trunk, trunk + concept supervision
-- [ ] Evaluate on time:matters internal offer data (Phase 2b)
-
-See `PHASE2_LOGISTICS.md` for the full experiment design.
+- [x] Session integrity — bind moves/resign to player_id
+- [x] Benchmark harness — win rate vs random, heuristic, Stockfish at low depth
+- [x] Promotion type support (all four pieces, not just queen)
+- [x] Move encoding tests
+- [ ] Train a strong model: PGN warm start + sustained self-play, tracked with the benchmark harness

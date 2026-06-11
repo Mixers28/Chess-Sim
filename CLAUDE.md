@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Session Hygiene
 
-- At the start of every session, read all files in `~/.claude/projects/-mnt-e-GD-Chess-Sim/memory/` to load context.
+- At the start of every session, read all files in this project's Claude Code memory directory (`~/.claude/projects/<project-slug>/memory/`) to load context.
 - After any significant decision, architectural change, or user correction, update or create the relevant memory file and refresh `MEMORY.md`.
 - In long sessions: re-check memory files after every ~10 tool calls or whenever the topic shifts, and update stale entries before the session ends.
 
@@ -16,9 +16,6 @@ python app.py
 
 # Standalone self-play training (CLI, 10k games)
 python chess_wargames.py
-
-# Tic-Tac-Toe Q-learning demo (unrelated)
-python wargames.py
 ```
 
 **Dependencies**: Python 3.10+, PyTorch, FastAPI, Uvicorn, python-chess, numpy, pydantic. GPU strongly recommended; CPU self-play is ~1.2s/simulation.
@@ -114,11 +111,6 @@ docker build -t chess-sim .
 docker run -p 8000:8000 -v ./checkpoint:/app/checkpoint chess-sim
 ```
 
-### Unused Files
-
-- `chess_dqn.py`: Early DQN approach, not used in current pipeline.
-- `agent.py`, `game.py`, `wargames.py`: Tic-Tac-Toe Q-learning demo, completely separate from chess.
-
 
 ## Reasoning Architecture
 
@@ -128,19 +120,8 @@ docker run -p 8000:8000 -v ./checkpoint:/app/checkpoint chess-sim
 - Auxiliary head off the res_tower; does NOT bottleneck policy/value heads
 - Supervised with auto-labels from `chess_env.compute_concept_labels()`
 - Concept loss weight: 0.1
+- Used for search-grounded move explanations in the web UI
 
-### Transfer Learning Target: time:matters Logistics
-- LogisticsInputAdapter maps offer feature vectors → 256×8×8 latent
-- Chess res_tower trunk frozen initially, fine-tuned on offer outcomes
-- Offer features: origin, destination, cargo_class, weight_kg, 
-  deadline_hours, declared_value, dgr_class, service_tier
-- New heads: OfferRankingHead (top-5 routes), OfferValueHead 
-  (on-time probability × margin)
-
-### Concept → Logistics Mapping
-- material_balance    → margin_headroom
-- king_safety         → critical_node_risk  
-- piece_mobility      → route_optionality
-- pawn_structure      → supply_chain_dependency
-- space_control       → network_coverage
-- tactical_threat     → disruption_probability
+Note: a chess → logistics transfer learning direction (Phase 2) was explored
+and abandoned — the chess trunk showed no improvement over XGBoost on
+logistics prediction. The project is chess-only.

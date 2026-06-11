@@ -284,7 +284,11 @@ def _worker_init(az_channels, az_res_blocks):
     """Run once per worker process: create model + MCTS on GPU."""
     global _w_net, _w_mcts, _w_dev
     import torch
-    _w_dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _w_dev = torch.device(
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available()
+        else "cpu"
+    )
     _w_net = AlphaZeroNet(az_channels, az_res_blocks).to(_w_dev)
     _w_net.eval()
     _w_mcts = MCTS(_w_net, _w_dev, n_sims=MCTS_SIMS, batch_size=MCTS_BATCH)

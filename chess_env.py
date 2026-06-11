@@ -46,16 +46,11 @@ _EXTENDED_CENTRE = (
 
 def compute_concept_labels(board: chess.Board) -> np.ndarray:
     """
-    Compute 6 transferable strategic concept scores from the board.
+    Compute 6 strategic concept scores from the board.
     Returns float32 (6,) with all values in [0, 1], from the side-to-move's perspective.
 
-    Concept → logistics/security analogue:
-      material_balance  → margin_headroom
-      king_safety       → critical_node_risk (inverted)
-      piece_mobility    → route_optionality
-      pawn_structure    → supply_chain_dependency
-      space_control     → network_coverage
-      tactical_threat   → disruption_probability
+    Concepts: material_balance, king_safety, piece_mobility,
+    pawn_structure, space_control, tactical_threat.
     """
     side = board.turn
     opp  = not side

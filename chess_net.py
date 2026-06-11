@@ -62,13 +62,9 @@ class ConceptBottleneck(nn.Module):
     Supervised by auto-labels from python-chess (see chess_env.compute_concept_labels).
     Sits between res_tower and policy/value heads; does NOT bottleneck them.
 
-    Concept scores transfer to logistics/security domains:
-      material_balance → margin_headroom
-      king_safety      → critical_node_risk
-      piece_mobility   → route_optionality
-      pawn_structure   → supply_chain_dependency
-      space_control    → network_coverage
-      tactical_threat  → disruption_probability
+    Concepts: material_balance, king_safety, piece_mobility,
+    pawn_structure, space_control, tactical_threat.
+    Scores feed the search-grounded move explanations in the web UI.
     """
 
     def __init__(self, channels: int):
