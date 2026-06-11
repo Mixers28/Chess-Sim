@@ -59,10 +59,10 @@ app.py                (FastAPI server, background selfplay thread, human game lo
 | `INPUT_PLANES` | 19 | Board encoding depth |
 | `ACTION_SIZE` | 8192 | 4096 standard + 4096 knight underpromotions |
 | `REPLAY_CAPACITY` | 100,000 | Circular training buffer |
-| `MCTS_SIMS_SP` | 100 | Self-play simulations/move |
+| `MCTS_SIMS_SP` | 200 | Self-play simulations/move (GPU; 20 on CPU) |
 | `MCTS_SIMS_HUMAN` | 50/10 | GPU/CPU simulations for human play |
-| `MAX_MOVES` | 80 | Half-move cap before draw |
-| `RESIGN_THRESHOLD` | -0.9 | Value below which engine may resign |
+| `MAX_MOVES` | 200 | Half-move cap (self-play); cap-outs labeled -0.15, true draws 0 |
+| `RESIGN_THRESHOLD` | -0.70 | Self-play resign threshold; 10% of games play with resign disabled |
 
 ### Board Encoding (`chess_env.py`)
 
@@ -82,7 +82,8 @@ Uses **batched virtual-loss** parallelism: multiple simulations are run with vir
 
 ### Training (`chess_wargames.py`)
 
-- `selfplay_game()`: One full game with opening book (first 8 moves), exponential temperature decay `τ(n) = max(0.05, exp(-n/20))`, resign mechanism (5 consecutive moves below -0.9).
+- `selfplay_game()`: One full game with opening book (first 8 moves; book positions are not training samples), exponential temperature decay `τ(n) = max(0.05, exp(-n/20))`, resign mechanism (3 consecutive moves below -0.70, disabled in 10% of games for calibration).
+- `_run_benchmark()`: every 500 self-play games, plays fixed-opponent matches (random + heuristic) and appends scores to `benchmark/history.jsonl` for objective strength tracking.
 - `az_update()`: Policy (cross-entropy) + value (MSE) loss, combined as `policy + 0.5 * value`, gradient clipped to norm ≤ 1.0. 5 steps per game.
 - Data augmentation: `mirror_sample()` horizontally flips each position for 2× training data.
 

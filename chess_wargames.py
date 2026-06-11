@@ -12,8 +12,10 @@ Training data per game:
 """
 
 import atexit
+import json
 import math
 import multiprocessing as _mp
+import os
 import random
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -25,7 +27,7 @@ import torch.nn.functional as F
 
 import chess_model as M
 from chess_model import save_checkpoint, load_checkpoint
-from chess_env import encode, idx_to_move, move_to_idx, legal_mask, mirror_sample, ACTION_SIZE, compute_concept_labels, _PIECE_VALUES
+from chess_env import encode, idx_to_move, mirror_sample, compute_concept_labels, _PIECE_VALUES
 from chess_mcts import MCTS
 from chess_net import AlphaZeroNet
 
@@ -34,11 +36,16 @@ TOTAL_GAMES  = 10_000
 REPORT_EVERY = 10         # games between CLI status lines
 BATCH_SIZE   = 512
 TRAIN_STEPS  = 5          # gradient steps after each game
-MCTS_SIMS    = 100        # simulations per move during self-play
+MCTS_SIMS    = 200        # simulations per move during self-play
 MCTS_BATCH   = 64         # leaf nodes evaluated per GPU forward pass
-MAX_MOVES    = 60         # half-moves per game cap
+MAX_MOVES    = 200        # half-moves per game cap
 MATERIAL_WIN = 6          # material advantage (in pawns) treated as decisive win
 SAVE_EVERY   = 50         # games between checkpoint saves
+
+# Periodic fixed-opponent benchmark (objective strength tracking)
+BENCHMARK_EVERY = 500     # self-play games between benchmark matches
+BENCHMARK_GAMES = 20      # games per opponent per benchmark
+BENCHMARK_SIMS  = 50      # MCTS sims per move during benchmark
 
 # Temperature decays exponentially: τ(n) = max(0.05, exp(-n / TEMP_DECAY))
 # At move 15: ~0.37  |  move 30: ~0.14  |  move 45: ~0.05 (floor)
@@ -48,6 +55,10 @@ TEMP_DECAY   = 20.0
 # Won't trigger until the value head learns to produce values near ±1.
 RESIGN_THRESHOLD   = -0.70
 RESIGN_CONSECUTIVE = 3
+# Fraction of games played with resignation disabled. Keeps a stream of
+# played-out "hopeless" positions in the data so wrong resignations can't
+# become self-reinforcing labels.
+RESIGN_DISABLE_PROB = 0.10
 N_WORKERS          = 8 if torch.cuda.is_available() else 1  # parallel self-play workers
 
 
@@ -183,15 +194,14 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
     move_n         = 0
     consecutive_low = 0   # consecutive moves where root value < RESIGN_THRESHOLD
     resigned       = False
+    resign_allowed = random.random() >= RESIGN_DISABLE_PROB
 
     while not board.is_game_over() and move_n < MAX_MOVES:
-        # Try book move first (early game diversity)
+        # Try book move first (early game diversity). Book positions are NOT
+        # recorded as training samples: a one-hot target on a randomly chosen
+        # book move is label noise, not a search-derived policy.
         book_mv = _book_move(board)
         if book_mv is not None:
-            policy_target = np.zeros(ACTION_SIZE, dtype=np.float32)
-            policy_target[move_to_idx(book_mv)] = 1.0
-            records.append((encode(board), policy_target, board.turn,
-                            compute_concept_labels(board), board.copy(stack=False)))
             board.push(book_mv)
             move_n += 1
             if position_cb is not None:
@@ -212,7 +222,7 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
         # Resign check — activates naturally once value head produces values near ±1
         if root_value < RESIGN_THRESHOLD:
             consecutive_low += 1
-            if consecutive_low >= RESIGN_CONSECUTIVE:
+            if resign_allowed and consecutive_low >= RESIGN_CONSECUTIVE:
                 resigned = True
                 break
         else:
@@ -249,6 +259,7 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
             return samples, result, move_n
 
     # Determine outcome
+    capped = False
     if resigned:
         # Current player to move lost (they gave up)
         result = "B" if board.turn == chess.WHITE else "W"
@@ -256,7 +267,7 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
     else:
         outcome = board.outcome()
         if outcome is None:
-            result, winner = "D", None   # move cap
+            result, winner, capped = "D", None, True   # hit MAX_MOVES
         elif outcome.winner == chess.WHITE:
             result, winner = "W", chess.WHITE
         elif outcome.winner == chess.BLACK:
@@ -264,10 +275,15 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
         else:
             result, winner = "D", None
 
-    # Build training samples: fill in value_target from each player's perspective
+    # Build training samples: fill in value_target from each player's perspective.
+    # Genuine draws (stalemate, repetition, etc.) are worth 0; the mild negative
+    # label applies only to games cut off by the move cap, to discourage stalling.
     samples = []
     for state, policy, color, concepts, board_copy in records:
-        v = -0.15 if winner is None else (1.0 if color == winner else -1.0)
+        if winner is None:
+            v = -0.15 if capped else 0.0
+        else:
+            v = 1.0 if color == winner else -1.0
         samples.append((state, policy, v, concepts, board_copy))
 
     return samples, result, move_n
@@ -311,6 +327,38 @@ def _play_game(state_dict_cpu):
     return processed, result, n_moves
 
 
+# ── Periodic benchmark ─────────────────────────────────────────────────
+def _run_benchmark(net, dev) -> dict:
+    """
+    Quick fixed-opponent match (random + heuristic) to track playing strength
+    objectively over training. Appends one line to benchmark/history.jsonl.
+    """
+    from benchmark import RandomPlayer, HeuristicPlayer, run_match
+
+    net.eval()
+    mcts = MCTS(net, dev, n_sims=BENCHMARK_SIMS,
+                batch_size=min(BENCHMARK_SIMS, 32))
+    scores = {}
+    for opp in (RandomPlayer(), HeuristicPlayer()):
+        r = run_match(mcts, opp, BENCHMARK_GAMES, verbose=False)
+        scores[opp.name] = round(
+            (r["wins"] + 0.5 * r["draws"]) / r["games"] * 100, 1)
+
+    print(f"  [benchmark] games={M.total_games:,}  "
+          + "  ".join(f"vs {name}: {pct}%" for name, pct in scores.items()))
+
+    bench_dir = os.path.join(os.path.dirname(__file__), "benchmark")
+    os.makedirs(bench_dir, exist_ok=True)
+    with open(os.path.join(bench_dir, "history.jsonl"), "a") as f:
+        f.write(json.dumps({
+            "games": M.total_games,
+            "elo":   round(M.ai_elo),
+            "time":  time.time(),
+            **scores,
+        }) + "\n")
+    return scores
+
+
 # ── Training loop ──────────────────────────────────────────────────────
 def train():
     if not load_checkpoint():
@@ -342,8 +390,9 @@ def train():
           f"{'Buffer':>8}  {'Elo':>6}")
     print("  " + "─" * 82)
 
-    t_round_start = time.time()
-    game_n = start
+    t_round_start  = time.time()
+    game_n         = start
+    last_benchmark = M.total_games
 
     with ProcessPoolExecutor(
         max_workers=N_WORKERS,
@@ -395,6 +444,10 @@ def train():
 
             if M.total_games % SAVE_EVERY < N_WORKERS:
                 save_checkpoint()
+
+            if M.total_games - last_benchmark >= BENCHMARK_EVERY:
+                _run_benchmark(net, dev)
+                last_benchmark = M.total_games
 
             game_n += N_WORKERS
 

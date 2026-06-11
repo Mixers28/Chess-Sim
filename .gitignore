@@ -6,3 +6,7 @@ __pycache__/
 checkpoint/
 venv/
 .venv/
+*.pgn
+*.zip
+*.log
+benchmark/
