@@ -98,7 +98,11 @@ class StockfishPlayer:
 
 def load_ai(checkpoint_path: str, n_sims: int):
     """Load model weights and return (net, mcts, meta_dict)."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available()
+        else "cpu"
+    )
 
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
@@ -180,10 +184,11 @@ def run_match(mcts, opponent, n_games: int, verbose: bool = True) -> dict:
     for i in range(n_games):
         ai_color = chess.WHITE if i < half else chess.BLACK
         outcome  = play_game(ai_color, mcts, opponent)
-        results[outcome + "s"] += 1
+        key      = {"win": "wins", "draw": "draws", "loss": "losses"}[outcome]
+        results[key] += 1
 
         if verbose:
-            symbol = {"wins": "W", "draws": "D", "losses": "L"}[outcome + "s"]
+            symbol = {"wins": "W", "draws": "D", "losses": "L"}[key]
             print(f"  {opponent.name:12s} game {i+1:>3}/{n_games}  "
                   f"({'White' if ai_color == chess.WHITE else 'Black'})  {symbol}",
                   flush=True)
