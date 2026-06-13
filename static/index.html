@@ -305,7 +305,7 @@
       letter-spacing: 0.12em;
     }
 
-    /* ── Live self-play tab ── */
+    /* ── Model tab ── */
     #live-info {
       font-size: 0.78rem;
       color: #666;
@@ -355,19 +355,37 @@
     .training-stat { text-align: center; }
     .training-stat .val { font-size: 1.6rem; font-weight: bold; color: #fff; }
     .training-stat .lbl { font-size: 0.62rem; color: #444; text-transform: uppercase; letter-spacing: 0.1em; margin-top: 3px; }
+
+    @media (max-width: 760px) {
+      header { padding: 12px 16px; }
+      header h1 { font-size: 1.1rem; }
+      .tab-btn { padding: 10px 14px; letter-spacing: 0.1em; }
+      .container {
+        flex-direction: column;
+        align-items: center;
+        padding: 16px;
+        gap: 18px;
+      }
+      .board-col, #board, #live-board, .eval-bar-wrap {
+        width: min(420px, calc(100vw - 32px));
+      }
+      .sidebar { width: min(420px, calc(100vw - 32px)); min-width: 0; }
+      .stats-tab-container { padding: 16px; }
+      .training-grid { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
 
 <header>
   <h1>W A R G A M E S</h1>
-  <p>AlphaZero · You are White · The AI learns from every game</p>
+  <p>AlphaZero · You are White · Human games are recorded for training</p>
 </header>
 
 <!-- Tab bar -->
 <div class="tab-bar">
   <button class="tab-btn active" data-tab="play">PLAY</button>
-  <button class="tab-btn"        data-tab="live">SELF-PLAY</button>
+  <button class="tab-btn"        data-tab="live">MODEL</button>
   <button class="tab-btn"        data-tab="stats">STATS</button>
 </div>
 
@@ -400,7 +418,7 @@
           </div>
           <div class="stat">
             <div class="value" id="total-games">—</div>
-            <div class="label">Total Games</div>
+            <div class="label">Training Games</div>
           </div>
         </div>
       </div>
@@ -469,19 +487,34 @@
 
       <div class="selfplay-row">
         <div class="dot" id="sp-dot"></div>
-        <span id="sp-label">Self-play: —</span>
+        <span id="sp-label">Model: —</span>
       </div>
 
     </div><!-- /sidebar -->
   </div>
 </div>
 
-<!-- ══ SELF-PLAY TAB ═════════════════════════════════════════════════ -->
+<!-- ══ MODEL TAB ═════════════════════════════════════════════════════ -->
 <div id="tab-live" class="tab-content">
-  <div class="container" style="flex-direction:column; align-items:center;">
-    <div id="live-board"></div>
-    <div id="live-info">Waiting for self-play…</div>
-    <div id="live-move-counter"></div>
+  <div class="stats-tab-container">
+    <div class="chart-card">
+      <h3>Deployed Model</h3>
+      <div class="training-grid">
+        <div class="training-stat">
+          <div class="val" id="model-version">—</div>
+          <div class="lbl">Version</div>
+        </div>
+        <div class="training-stat">
+          <div class="val" id="model-games">—</div>
+          <div class="lbl">Training Games</div>
+        </div>
+        <div class="training-stat">
+          <div class="val" id="model-device">—</div>
+          <div class="lbl">Inference Device</div>
+        </div>
+      </div>
+      <div id="model-saved-at" style="font-size:0.7rem;color:#555;text-align:center;margin-top:18px;"></div>
+    </div>
   </div>
 </div>
 
@@ -503,15 +536,15 @@
       <div class="training-grid">
         <div class="training-stat">
           <div class="val" id="stat-total">—</div>
-          <div class="lbl">Total Games</div>
+          <div class="lbl">Model Training Games</div>
         </div>
         <div class="training-stat">
           <div class="val" id="stat-sp">—</div>
-          <div class="lbl">Self-play Games</div>
+          <div class="lbl">Human Games</div>
         </div>
         <div class="training-stat">
           <div class="val" id="stat-buf">—</div>
-          <div class="lbl">Replay Buffer</div>
+          <div class="lbl">AI Elo</div>
         </div>
       </div>
     </div>
@@ -936,20 +969,27 @@ async function refreshStats() {
   try {
     const s = await api('GET', '/api/stats');
     document.getElementById('elo-value').textContent   = s.ai_elo;
-    document.getElementById('total-games').textContent = s.total_games.toLocaleString();
+    const model = s.model || {};
+    const trainingGames = model.training_games || 0;
+    document.getElementById('total-games').textContent = trainingGames.toLocaleString();
     document.getElementById('h-wins').textContent      = s.human_wins;
     document.getElementById('h-draws').textContent     = s.human_draws;
     document.getElementById('h-losses').textContent    = s.human_losses;
 
-    document.getElementById('stat-total').textContent  = s.total_games.toLocaleString();
-    document.getElementById('stat-sp').textContent     = s.selfplay_games.toLocaleString();
-    document.getElementById('stat-buf').textContent    = s.replay_buffer.toLocaleString();
+    document.getElementById('stat-total').textContent  = trainingGames.toLocaleString();
+    document.getElementById('stat-sp').textContent     = s.human_games.toLocaleString();
+    document.getElementById('stat-buf').textContent    = s.ai_elo.toLocaleString();
+    document.getElementById('model-version').textContent = model.version || 'unversioned';
+    document.getElementById('model-games').textContent = trainingGames.toLocaleString();
+    document.getElementById('model-device').textContent = (s.device || 'unknown').toUpperCase();
+    document.getElementById('model-saved-at').textContent =
+      model.saved_at ? `Saved ${new Date(model.saved_at).toLocaleString()}` : 'Legacy checkpoint metadata';
 
-    const selfplaying       = !s.human_game_active;
+    const modelReady        = Boolean(model.version && model.version !== 'unversioned');
     const dot               = document.getElementById('sp-dot');
     const label             = document.getElementById('sp-label');
-    dot.className           = 'dot' + (selfplaying ? ' active' : '');
-    label.textContent       = `Self-play: ${s.selfplay_games.toLocaleString()} games  buf=${s.replay_buffer.toLocaleString()}`;
+    dot.className           = 'dot' + (modelReady ? ' active' : '');
+    label.textContent       = `Model: ${trainingGames.toLocaleString()} training games`;
   } catch (_) {}
 }
 
@@ -1018,31 +1058,8 @@ function drawEloChart(history) {
   `;
 }
 
-// ── Live self-play SSE ────────────────────────────────────────────
-let liveBoard = null;
-
-function initLiveBoard() {
-  liveBoard = Chessboard('live-board', {
-    draggable:  false,
-    position:   'start',
-    pieceTheme: 'https://lichess1.org/assets/piece/cburnett/{piece}.svg',
-  });
-
-  const evtSource = new EventSource('/api/selfplay-stream');
-  evtSource.onmessage = e => {
-    const data = JSON.parse(e.data);
-    liveBoard.position(data.fen, false);
-    document.getElementById('live-info').textContent =
-      `Game #${(data.game + 1).toLocaleString()}  —  Move ${data.move_n}: ${data.move}`;
-  };
-  evtSource.onerror = () => {
-    document.getElementById('live-info').textContent = 'Stream disconnected — refresh to reconnect';
-  };
-}
-
 // ── Boot ──────────────────────────────────────────────────────────
 initBoard();
-initLiveBoard();
 refreshStats();
 refreshEloChart();
 setInterval(refreshStats, 5000);

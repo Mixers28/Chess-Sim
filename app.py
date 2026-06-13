@@ -3,11 +3,10 @@ app.py — Chess AlphaZero Web Server
 
 FastAPI server that:
   • Serves a chess web UI for humans to play against the AI
-  • Runs background self-play (MCTS) in a daemon thread
-  • Broadcasts live self-play positions via SSE
-  • Learns from human games (stores training samples + gradient updates)
+  • Loads trainer-owned model checkpoints for inference
+  • Exports human games for later trainer ingestion
   • Tracks Elo rating and progression history
-  • Persists all knowledge via checkpoints
+  • Persists web-only statistics separately from model weights
 
 Run:
     python3 app.py
@@ -16,7 +15,6 @@ Then open http://localhost:8000
 
 import asyncio
 import atexit
-import json
 import os
 import random
 import threading
@@ -30,30 +28,28 @@ import chess.pgn
 import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import chess_model as M
-from chess_model import load_checkpoint, save_checkpoint
-from chess_env import encode, idx_to_move, move_to_idx, legal_mask, mirror_sample, ACTION_SIZE, compute_concept_labels
+from chess_model import load_checkpoint
+from chess_env import encode, idx_to_move, move_to_idx, legal_mask, compute_concept_labels
 from chess_mcts import MCTS
-from chess_wargames import az_update, selfplay_game, RESIGN_THRESHOLD
+from chess_wargames import RESIGN_THRESHOLD
 
 STATIC_DIR      = os.path.join(os.path.dirname(__file__), "static")
+WEB_STATS_PATH  = os.environ.get(
+    "WEB_STATS_PATH",
+    os.path.join(os.path.dirname(__file__), "checkpoint", "web_stats.pt"),
+)
+HUMAN_GAMES_DIR = os.environ.get(
+    "HUMAN_GAMES_DIR",
+    os.path.join(os.path.dirname(__file__), "checkpoint", "human_games"),
+)
 import torch as _t
 _gpu = _t.cuda.is_available() or _t.backends.mps.is_available()
-MCTS_SIMS_SP    = 200 if _gpu else 20   # simulations per move during self-play
 MCTS_SIMS_HUMAN = 50 if _gpu else 20
-TRAIN_STEPS     = 5     # gradient steps after each game
-SAVE_EVERY_SP   = 50    # self-play games between saves
-MAX_MOVES       = 256
-
-
-# ── Live self-play state (for SSE stream) ─────────────────────────────
-_sp_state: dict = {}
-_sp_lock        = threading.Lock()
-
 
 # ── Human game state ──────────────────────────────────────────────────
 GAME_INACTIVITY_TIMEOUT = 120   # seconds before an orphaned game is auto-abandoned
@@ -87,7 +83,13 @@ _queue_lock = threading.Lock()
 
 
 def _dequeue_next() -> None:
-    """Start the next non-expired queued game. Call after a game ends."""
+    """Start the next queued game using the global game->queue lock order."""
+    with game_lock:
+        _dequeue_next_locked()
+
+
+def _dequeue_next_locked() -> None:
+    """Start the next queued game. The caller must hold game_lock."""
     now = time.time()
     entry = None
     with _queue_lock:
@@ -102,13 +104,49 @@ def _dequeue_next() -> None:
             break
     if entry is None:
         return
-    with game_lock:
-        current_game.reset()
-        current_game.active    = True
-        current_game.player_id = entry["player_id"]
-        if entry["n_sims"] is not None:
-            current_game.n_sims = max(5, min(entry["n_sims"], 800))
+    current_game.reset()
+    current_game.active    = True
+    current_game.player_id = entry["player_id"]
+    if entry["n_sims"] is not None:
+        current_game.n_sims = max(5, min(entry["n_sims"], 800))
     M.human_game_active.set()
+
+
+def _export_human_game(result: str, white_reward: float, black_reward: float) -> None:
+    """Persist human-game samples without mutating the inference model."""
+    rows = [
+        (state, policy, white_reward, concepts, "white")
+        for state, policy, concepts, _ in current_game.traj_w
+    ]
+    rows.extend(
+        (state, policy, black_reward, concepts, "black")
+        for state, policy, concepts, _ in current_game.traj_b
+    )
+    if not rows:
+        return
+
+    os.makedirs(HUMAN_GAMES_DIR, exist_ok=True)
+    filename = f"{time.time_ns()}-{uuid.uuid4().hex[:8]}.npz"
+    path = os.path.join(HUMAN_GAMES_DIR, filename)
+    temp_path = f"{path}.tmp.npz"
+    states, policies, values, concepts, colors = zip(*rows)
+    try:
+        np.savez_compressed(
+            temp_path,
+            states=np.asarray(states, dtype=np.float16),
+            policies=np.asarray(policies, dtype=np.float16),
+            values=np.asarray(values, dtype=np.float32),
+            concepts=np.asarray(concepts, dtype=np.float32),
+            colors=np.asarray(colors),
+            moves=np.asarray(current_game.move_history),
+            result=np.asarray(result),
+            model_version=np.asarray(M.model_version),
+        )
+        os.replace(temp_path, path)
+        print(f"[human-game] Exported {len(rows)} samples → {path}")
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 # ── Finalize human game (called under game_lock) ───────────────────────
@@ -128,24 +166,11 @@ def _finalize_human_game(ai_resigned: bool = False):
         result, w_r, b_r, ai_score = "draw", 0.0, 0.0, 0.5
 
     current_game.outcome = result
-
-    # Build training samples from human game trajectories
-    dummy_policy = np.zeros(ACTION_SIZE, dtype=np.float32)
-
-    for traj, reward in [(current_game.traj_w, w_r), (current_game.traj_b, b_r)]:
-        for state, policy, concepts, board_copy in traj:
-            p = policy if policy is not None else dummy_policy
-            M.replay_buf.push(state, p, reward, concepts)
-            ms, mp, mv = mirror_sample(state, p, reward)
-            mirrored_concepts = compute_concept_labels(
-                board_copy.transform(chess.flip_horizontal)
-            )
-            M.replay_buf.push(ms, mp, mv, mirrored_concepts)
-
-    # Gradient update
-    with M.model_lock:
-        for _ in range(TRAIN_STEPS):
-            az_update(M.policy_net, M.replay_buf, M.optimizer, M.scheduler)
+    try:
+        _export_human_game(result, w_r, b_r)
+    except Exception:
+        print("[human-game] Export failed", flush=True)
+        traceback.print_exc()
 
     # Elo + stats
     M.ai_elo       = M.update_elo(M.ai_elo, M.ELO_DEFAULT_HUMAN, ai_score)
@@ -161,100 +186,85 @@ def _finalize_human_game(ai_resigned: bool = False):
     M.record_elo()
     current_game.active = False
     M.human_game_active.clear()
-    save_checkpoint()   # always save after each human game (keeps stats.pt current on Coolify)
-    _dequeue_next()
-
-
-# ── Background self-play thread ────────────────────────────────────────
-_sp_thread: threading.Thread | None = None   # module-level for watchdog access
-
-
-def selfplay_loop():
-    board = chess.Board()
-    mcts  = MCTS(M.policy_net, M.device, n_sims=MCTS_SIMS_SP)
-
-    while not M.shutdown_flag:
-        try:
-            M.policy_net.eval()
-
-            def _broadcast(fen, move_uci, move_n):
-                with _sp_lock:
-                    _sp_state.update({
-                        "fen":    fen,
-                        "move":   move_uci,
-                        "game":   M.selfplay_games,
-                        "move_n": move_n,
-                    })
-
-            samples, _, _ = selfplay_game(board, mcts, position_cb=_broadcast)
-
-            for state, policy, value, concepts, board_copy in samples:
-                M.replay_buf.push(state, policy, value, concepts)
-                ms, mp, mv = mirror_sample(state, policy, value)
-                mirrored_concepts = compute_concept_labels(
-                    board_copy.transform(chess.flip_horizontal)
-                )
-                M.replay_buf.push(ms, mp, mv, mirrored_concepts)
-
-            with M.model_lock:
-                for _ in range(TRAIN_STEPS):
-                    az_update(M.policy_net, M.replay_buf, M.optimizer, M.scheduler)
-
-            M.total_games    += 1
-            M.selfplay_games += 1
-
-            if M.selfplay_games % SAVE_EVERY_SP == 0:
-                save_checkpoint()
-
-        except Exception:
-            print("[selfplay] Error — resetting board and continuing:", flush=True)
-            traceback.print_exc()
-            board.reset()
-            time.sleep(1)
+    M.save_stats(WEB_STATS_PATH)
+    _dequeue_next_locked()
 
 
 # ── App lifespan ──────────────────────────────────────────────────────
-def _start_selfplay_thread() -> threading.Thread:
-    global _sp_thread
-    t = threading.Thread(target=selfplay_loop, daemon=True, name="selfplay")
-    t.start()
-    _sp_thread = t
-    return t
+def _model_file_signature() -> tuple[int, int, int] | None:
+    try:
+        stat = os.stat(M.MODEL_PATH)
+    except FileNotFoundError:
+        return None
+    return stat.st_ino, stat.st_size, stat.st_mtime_ns
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if not load_checkpoint():
+    migrating_legacy_web_stats = (
+        not os.path.exists(WEB_STATS_PATH) and os.path.exists(M.STATS_PATH)
+    )
+    if not load_checkpoint(
+        stats_path=WEB_STATS_PATH,
+        fallback_stats_path=M.STATS_PATH,
+        load_buffer=False,
+        load_training_state=False,
+    ):
         print("[app] Starting fresh — no checkpoint found.")
+    elif migrating_legacy_web_stats:
+        # Preserve old human counters/Elo without importing trainer generations.
+        M.total_games = M.human_games
+        M.selfplay_games = 0
+        M.save_stats(WEB_STATS_PATH)
 
     M.policy_net.eval()
-    atexit.register(save_checkpoint)
+    atexit.register(M.save_stats, WEB_STATS_PATH)
 
     dev_str = str(M.device).upper()
     print(f"[app] AlphaZero+SE | {M.AZ_RES_BLOCKS} res blocks | "
           f"{M.AZ_CHANNELS} channels | {M.n_params:,} params | Device: {dev_str}")
-    if M.device.type == "cpu":
-        # Leave 1 core for FastAPI; give the rest to PyTorch inference
-        cpu_count = os.cpu_count() or 2
-        torch.set_num_threads(max(1, cpu_count - 1))
-        print(f"[app] CPU-only mode — self-play disabled | PyTorch threads: {max(1, cpu_count - 1)}")
-    else:
-        _start_selfplay_thread()
+    cpu_count = os.cpu_count() or 2
+    torch.set_num_threads(max(1, cpu_count - 1))
+    print(f"[app] Inference-only mode | PyTorch threads: {max(1, cpu_count - 1)}")
 
-    async def _watchdog():
+    loaded_signature = _model_file_signature()
+    failed_signature = None
+    pending_signature = None
+
+    async def _model_watcher():
+        nonlocal loaded_signature, failed_signature, pending_signature
         while not M.shutdown_flag:
-            await asyncio.sleep(30)
-            if M.device.type != "cpu" and _sp_thread and not _sp_thread.is_alive() and not M.shutdown_flag:
-                print("[app] Selfplay thread died — restarting", flush=True)
-                _start_selfplay_thread()
+            await asyncio.sleep(5)
+            signature = _model_file_signature()
+            if signature is None or signature in (loaded_signature, failed_signature):
+                pending_signature = None
+                continue
+            if signature != pending_signature:
+                pending_signature = signature
+                continue
+            with game_lock:
+                if current_game.active:
+                    continue
+                if M.reload_model_weights():
+                    loaded_signature = signature
+                    failed_signature = None
+                    pending_signature = None
+                    print(
+                        f"[app] Activated model {M.model_version} "
+                        f"({M.model_training_games:,} training games)"
+                    )
+                else:
+                    failed_signature = signature
+                    pending_signature = None
+                    print("[app] Rejected incompatible deployed model", flush=True)
 
-    wd = asyncio.create_task(_watchdog())
+    watcher = asyncio.create_task(_model_watcher())
 
     yield
 
     M.shutdown_flag = True
-    wd.cancel()
-    save_checkpoint()
+    watcher.cancel()
+    M.save_stats(WEB_STATS_PATH)
 
 
 app = FastAPI(lifespan=lifespan)
@@ -299,7 +309,8 @@ async def get_stats():
         "human_game_active": M.human_game_active.is_set(),
         "queue_length":      q_len,
         "device":            str(M.device),
-        "selfplay_alive":    _sp_thread is not None and _sp_thread.is_alive(),
+        "selfplay_alive":    False,
+        "model":             M.get_model_metadata(),
     }
 
 
@@ -352,27 +363,6 @@ async def get_pgn():
         board.push(mv)
 
     return {"pgn": str(pgn_game)}
-
-
-@app.get("/api/selfplay-stream")
-async def selfplay_stream():
-    """SSE endpoint: streams live self-play board positions as they happen."""
-    async def generate():
-        last_key = None
-        while True:
-            with _sp_lock:
-                state = dict(_sp_state)
-            key = (state.get("game"), state.get("move_n"))
-            if state and key != last_key:
-                last_key = key
-                yield f"data: {json.dumps(state)}\n\n"
-            await asyncio.sleep(0.25)
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
 
 
 @app.post("/api/new-game")

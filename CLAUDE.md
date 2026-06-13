@@ -20,16 +20,18 @@ python chess_wargames.py
 
 **Dependencies**: Python 3.10+, PyTorch, FastAPI, Uvicorn, python-chess, numpy, pydantic. GPU strongly recommended; CPU self-play is ~1.2s/simulation.
 
-Checkpoints are saved to `checkpoint/` (excluded from git) — automatically every 50 self-play games or every 10 human games:
-- `model.pt` — weights, optimizer, scheduler (shared across machines; pushed to Coolify if `SYNC_MODEL_TARGET=user@host:/path/model.pt` is set)
-- `stats.pt` — Elo, game counts (per-machine)
-- `replay_buffer.npz` — up to 20k samples seeded across restarts
+Checkpoints are saved to `checkpoint/` (excluded from git):
+- `model.pt` — trainer-owned weights and generation metadata; deployed atomically after each 500-game benchmark
+- `stats.pt` — trainer game counts
+- `web_stats.pt` — web-only human Elo and game counts
+- `replay_buffer.npz` — up to 20k samples seeded across trainer restarts
+- `human_games/*.npz` — human-game samples exported by the inference server
 
 **Virtual env**: `./venv/` — activate with `source venv/bin/activate`.
 
 ## Architecture
 
-This is an **AlphaZero-style chess engine** with a web UI for human play and continuous background self-play learning.
+This is an **AlphaZero-style chess engine** with a dedicated self-play trainer and an inference-only web UI for human play.
 
 ### Module Dependency Flow
 
@@ -42,9 +44,9 @@ chess_model.py        (singleton shared state: model, optimizer, replay buffer, 
     ↓
 chess_mcts.py         (batched virtual-loss MCTS, uses network + env)
     ↓
-chess_wargames.py     (selfplay_game(), az_update(), train() — also imported by app.py)
+chess_wargames.py     (selfplay_game(), az_update(), train(); app imports constants only)
     ↓
-app.py                (FastAPI server, background selfplay thread, human game logic)
+app.py                (FastAPI inference server, model hot reload, human game logic)
 ```
 
 ### Shared Mutable State Pattern
@@ -59,8 +61,8 @@ app.py                (FastAPI server, background selfplay thread, human game lo
 | `INPUT_PLANES` | 19 | Board encoding depth |
 | `ACTION_SIZE` | 8192 | 4096 standard + 4096 knight underpromotions |
 | `REPLAY_CAPACITY` | 100,000 | Circular training buffer |
-| `MCTS_SIMS_SP` | 200 | Self-play simulations/move (GPU; 20 on CPU) |
-| `MCTS_SIMS_HUMAN` | 50/10 | GPU/CPU simulations for human play |
+| `MCTS_SIMS` | 200 | Trainer self-play simulations/move |
+| `MCTS_SIMS_HUMAN` | 50/20 | GPU/CPU simulations for human play |
 | `MAX_MOVES` | 200 | Half-move cap (self-play); cap-outs labeled -0.15, true draws 0 |
 | `RESIGN_THRESHOLD` | -0.70 | Self-play resign threshold; 10% of games play with resign disabled |
 
@@ -84,12 +86,13 @@ Uses **batched virtual-loss** parallelism: multiple simulations are run with vir
 
 - `selfplay_game()`: One full game with opening book (first 8 moves; book positions are not training samples), exponential temperature decay `τ(n) = max(0.05, exp(-n/20))`, resign mechanism (3 consecutive moves below -0.70, disabled in 10% of games for calibration).
 - `_run_benchmark()`: every 500 self-play games, plays fixed-opponent matches (random + heuristic) and appends scores to `benchmark/history.jsonl` for objective strength tracking.
+- Local recovery checkpoints are saved every 50 games without deployment. A completed 500-game benchmark saves and atomically deploys that generation.
 - `az_update()`: Policy (cross-entropy) + value (MSE) loss, combined as `policy + 0.5 * value`, gradient clipped to norm ≤ 1.0. 5 steps per game.
 - Data augmentation: `mirror_sample()` horizontally flips each position for 2× training data.
 
 ### Web Server (`app.py`)
 
-`selfplay_loop()` runs as a background daemon thread, playing self-play games continuously and training after each. A watchdog thread monitors it and restarts on crash. Human games are tracked in `HumanGame` with MCTS tree reuse between moves. Human game outcomes feed into Elo tracking and contribute to the shared replay buffer.
+The web service is inference-only. It never writes `model.pt`, optimizer state, or replay data. It watches for a stable replacement of `model.pt` and hot-reloads it only while no human game is active. Human outcomes update `web_stats.pt`; completed games are exported to `checkpoint/human_games/`.
 
 ### API Endpoints (`app.py`)
 
@@ -97,7 +100,7 @@ Uses **batched virtual-loss** parallelism: multiple simulations are run with vir
 |--------|----------|-------------|
 | GET | `/` | Serve web UI |
 | GET | `/api/state` | Current board state (FEN, legal moves, outcome) |
-| GET | `/api/stats` | AI Elo, game counts, replay buffer size, device |
+| GET | `/api/stats` | AI Elo, human counts, device, deployed model metadata |
 | POST | `/api/new-game` | Start a new human vs AI game |
 | POST | `/api/move` | Submit a human move (UCI format) |
 | GET | `/api/ai-move` | Request the AI's move |
@@ -105,7 +108,7 @@ Uses **batched virtual-loss** parallelism: multiple simulations are run with vir
 
 ### Deployment
 
-A `Dockerfile` is included for containerized deployment (used with Coolify). It installs CPU-only PyTorch to keep image size manageable. The `checkpoint/` directory is bind-mounted in production so model weights persist across container restarts.
+A `Dockerfile` is included for containerized deployment (used with Coolify). It installs CPU-only PyTorch to keep image size manageable. The `checkpoint/` directory is bind-mounted in production so model weights, web stats, and human-game exports persist across container restarts.
 
 ```bash
 docker build -t chess-sim .

@@ -2,7 +2,7 @@
 chess_model.py — Shared singleton state for the AlphaZero chess engine.
 
 Imported by both chess_wargames.py (standalone training)
-and app.py (web server + background self-play).
+and app.py (inference-only web server).
 All mutable state lives here as module globals.
 
 Checkpoint split:
@@ -10,12 +10,15 @@ Checkpoint split:
   stats.pt  — Elo, game counts (each machine owns its own copy)
 
 Set env var SYNC_MODEL_TARGET=user@host:/path/model.pt to auto-push
-model.pt to Coolify after each save.
+benchmarked model generations to the inference host.
 """
 
 import os
 import random
+import shlex
+import subprocess
 import threading
+from datetime import datetime, timezone
 from collections import deque
 
 import numpy as np
@@ -53,7 +56,7 @@ STATS_PATH      = os.path.join(CHECKPOINT_DIR, "stats.pt")       # Elo/counts (l
 BUFFER_PATH     = os.path.join(CHECKPOINT_DIR, "replay_buffer.npz")
 BUFFER_SEED_SIZE = 20_000   # max samples persisted across restarts
 
-# Optional: set to auto-push model.pt to Coolify after each save
+# Optional: set to deploy benchmarked model generations to the inference host
 # e.g. export SYNC_MODEL_TARGET=user@server:/data/chess-sim/checkpoint/model.pt
 SYNC_MODEL_TARGET = os.environ.get("SYNC_MODEL_TARGET", "")
 SYNC_MODEL_PORT   = os.environ.get("SYNC_MODEL_PORT", "22")
@@ -122,6 +125,10 @@ human_losses   = 0      # AI won
 human_draws    = 0
 ai_elo         = float(ELO_DEFAULT_AI)
 elo_history: list[list] = []   # [[game_n, elo], ...] — recorded after each human game
+model_training_games = 0
+model_selfplay_games = 0
+model_saved_at = ""
+model_version = "unversioned"
 
 # ── Concurrency ───────────────────────────────────────────────────────
 model_lock        = threading.Lock()
@@ -143,44 +150,100 @@ def record_elo() -> None:
     elo_history.append([total_games, round(ai_elo)])
 
 
+def _atomic_torch_save(payload: dict, path: str) -> None:
+    """Write a torch checkpoint without exposing a partially written file."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        torch.save(payload, temp_path)
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def _stats_payload() -> dict:
+    return {
+        "total_games":    total_games,
+        "selfplay_games": selfplay_games,
+        "human_games":    human_games,
+        "human_wins":     human_wins,
+        "human_losses":   human_losses,
+        "human_draws":    human_draws,
+        "ai_elo":         ai_elo,
+        "elo_history":    elo_history,
+    }
+
+
+def save_stats(path: str = STATS_PATH) -> None:
+    """Persist machine-local counters without writing model weights."""
+    _atomic_torch_save(_stats_payload(), path)
+
+
 # ── Checkpoint save ───────────────────────────────────────────────────
-def save_checkpoint() -> None:
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+def save_checkpoint(*, sync_model: bool = True) -> None:
+    global model_training_games, model_selfplay_games
+    global model_saved_at, model_version
+
+    saved_at = datetime.now(timezone.utc).isoformat()
+    version = f"sp-{selfplay_games}-games-{total_games}"
     with model_lock:
-        # model.pt — weights only, shared between machines
-        torch.save({
-            "policy_state_dict": policy_net.state_dict(),
-            "optimizer_state":   optimizer.state_dict(),
-            "scheduler_state":   scheduler.state_dict(),
-            "az_channels":       AZ_CHANNELS,
-            "az_res_blocks":     AZ_RES_BLOCKS,
-            "az_input_planes":   INPUT_PLANES,
+        # model.pt is trainer-owned and shared with inference machines.
+        _atomic_torch_save({
+            "policy_state_dict":  policy_net.state_dict(),
+            "optimizer_state":    optimizer.state_dict(),
+            "scheduler_state":    scheduler.state_dict(),
+            "az_channels":        AZ_CHANNELS,
+            "az_res_blocks":      AZ_RES_BLOCKS,
+            "az_input_planes":    INPUT_PLANES,
+            "training_games":     total_games,
+            "selfplay_games":     selfplay_games,
+            "model_saved_at":     saved_at,
+            "model_version":      version,
         }, MODEL_PATH)
-        # stats.pt — Elo and game counts, local to each machine
-        torch.save({
-            "total_games":    total_games,
-            "selfplay_games": selfplay_games,
-            "human_games":    human_games,
-            "human_wins":     human_wins,
-            "human_losses":   human_losses,
-            "human_draws":    human_draws,
-            "ai_elo":         ai_elo,
-            "elo_history":    elo_history,
-        }, STATS_PATH)
+        save_stats()
+        model_training_games = total_games
+        model_selfplay_games = selfplay_games
+        model_saved_at = saved_at
+        model_version = version
     print(f"[checkpoint] Saved — games: {total_games:,}  Elo: {ai_elo:.0f}")
     save_replay_buffer()
-    _sync_model()
+    if sync_model:
+        _sync_model()
+
+
+def _split_remote_target(target: str) -> tuple[str, str]:
+    """Split user@host:/path into SSH host and remote path."""
+    if ":" not in target:
+        raise ValueError("SYNC_MODEL_TARGET must use user@host:/absolute/path format")
+    host, remote_path = target.split(":", 1)
+    if not host or not remote_path.startswith("/"):
+        raise ValueError("SYNC_MODEL_TARGET must use user@host:/absolute/path format")
+    return host, remote_path
 
 
 def _sync_model() -> None:
-    """Push model.pt to Coolify if SYNC_MODEL_TARGET env var is set."""
+    """Atomically push model.pt to the inference host."""
     if not SYNC_MODEL_TARGET:
         return
-    ret = os.system(f"scp -P {SYNC_MODEL_PORT} {MODEL_PATH} {SYNC_MODEL_TARGET} 2>/dev/null")
-    if ret == 0:
-        print(f"[sync] model.pt → {SYNC_MODEL_TARGET}")
-    else:
-        print(f"[sync] Warning: SCP failed (exit {ret})")
+    try:
+        host, remote_path = _split_remote_target(SYNC_MODEL_TARGET)
+        remote_temp = f"{remote_path}.uploading"
+        subprocess.run(
+            ["scp", "-P", SYNC_MODEL_PORT, MODEL_PATH, f"{host}:{remote_temp}"],
+            check=True,
+        )
+        activate_command = (
+            f"test -s {shlex.quote(remote_temp)} && "
+            f"mv -f -- {shlex.quote(remote_temp)} {shlex.quote(remote_path)}"
+        )
+        subprocess.run(
+            ["ssh", "-p", SYNC_MODEL_PORT, host, activate_command],
+            check=True,
+        )
+        print(f"[sync] model.pt → {SYNC_MODEL_TARGET} (atomic)")
+    except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+        print(f"[sync] Warning: model sync failed ({exc})")
 
 
 # ── Replay buffer save/load ───────────────────────────────────────────
@@ -219,18 +282,32 @@ def load_replay_buffer() -> int:
 
 
 # ── Checkpoint load ───────────────────────────────────────────────────
-def load_checkpoint() -> bool:
+def load_checkpoint(
+    *,
+    stats_path: str = STATS_PATH,
+    fallback_stats_path: str | None = None,
+    load_buffer: bool = True,
+    load_training_state: bool = True,
+) -> bool:
     """Load checkpoint — new split format first, legacy fallback for migration."""
     if os.path.exists(MODEL_PATH):
-        return _load_split()
+        return _load_split(
+            stats_path=stats_path,
+            fallback_stats_path=fallback_stats_path,
+            load_buffer=load_buffer,
+            load_training_state=load_training_state,
+        )
     if os.path.exists(CHECKPOINT_PATH):
         print("[checkpoint] Migrating legacy checkpoint.pt → split format")
         return _load_legacy()
     return False
 
 
-def _load_model_weights(path: str) -> bool:
+def _load_model_weights(path: str, *, load_training_state: bool = True) -> bool:
     """Load weights/optimizer/scheduler from path. Returns False on mismatch."""
+    global model_training_games, model_selfplay_games
+    global model_saved_at, model_version
+
     ckpt = torch.load(path, map_location=device, weights_only=True)
     if (ckpt.get("az_channels") != AZ_CHANNELS or
             ckpt.get("az_res_blocks") != AZ_RES_BLOCKS or
@@ -239,12 +316,17 @@ def _load_model_weights(path: str) -> bool:
         return False
     try:
         policy_net.load_state_dict(ckpt["policy_state_dict"], strict=False)
-        optimizer.load_state_dict(ckpt["optimizer_state"])
-        if "scheduler_state" in ckpt:
+        if load_training_state and "optimizer_state" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+        if load_training_state and "scheduler_state" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler_state"])
     except Exception as e:
         print(f"[checkpoint] State dict mismatch ({e}) — starting fresh.")
         return False
+    model_training_games = int(ckpt.get("training_games", 0))
+    model_selfplay_games = int(ckpt.get("selfplay_games", model_training_games))
+    model_saved_at = str(ckpt.get("model_saved_at", ""))
+    model_version = str(ckpt.get("model_version", "unversioned"))
     return True
 
 
@@ -266,13 +348,43 @@ def _load_stats(path: str) -> None:
     elo_history    = s.get("elo_history", [])
 
 
-def _load_split() -> bool:
-    if not _load_model_weights(MODEL_PATH):
+def _load_split(
+    *,
+    stats_path: str,
+    fallback_stats_path: str | None,
+    load_buffer: bool,
+    load_training_state: bool,
+) -> bool:
+    if not _load_model_weights(MODEL_PATH, load_training_state=load_training_state):
         return False
-    _load_stats(STATS_PATH)
+    if os.path.exists(stats_path):
+        _load_stats(stats_path)
+    elif fallback_stats_path and os.path.exists(fallback_stats_path):
+        _load_stats(fallback_stats_path)
+    else:
+        _load_stats(stats_path)
     print(f"[checkpoint] Resuming — games: {total_games:,}  Elo: {ai_elo:.0f}")
-    load_replay_buffer()
+    if load_buffer:
+        load_replay_buffer()
     return True
+
+
+def reload_model_weights() -> bool:
+    """Reload a deployed model without importing optimizer state."""
+    with model_lock:
+        loaded = _load_model_weights(MODEL_PATH, load_training_state=False)
+        if loaded:
+            policy_net.eval()
+    return loaded
+
+
+def get_model_metadata() -> dict:
+    return {
+        "training_games": model_training_games,
+        "selfplay_games": model_selfplay_games,
+        "saved_at": model_saved_at,
+        "version": model_version,
+    }
 
 
 def _load_legacy() -> bool:

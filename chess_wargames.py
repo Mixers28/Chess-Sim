@@ -364,7 +364,7 @@ def train():
     if not load_checkpoint():
         print("[wargames] Starting fresh — no checkpoint found.")
 
-    atexit.register(save_checkpoint)
+    atexit.register(save_checkpoint, sync_model=False)
 
     net  = M.policy_net
     buf  = M.replay_buf
@@ -442,12 +442,14 @@ def train():
                       f"  ({gph:.1f}/hr)")
                 t_round_start = time.time()
 
-            if M.total_games % SAVE_EVERY < N_WORKERS:
-                save_checkpoint()
-
-            if M.total_games - last_benchmark >= BENCHMARK_EVERY:
+            benchmark_due = M.total_games - last_benchmark >= BENCHMARK_EVERY
+            if benchmark_due:
                 _run_benchmark(net, dev)
                 last_benchmark = M.total_games
+                # Only benchmarked generations are deployed to the web node.
+                save_checkpoint(sync_model=True)
+            elif M.total_games % SAVE_EVERY < N_WORKERS:
+                save_checkpoint(sync_model=False)
 
             game_n += N_WORKERS
 
@@ -456,7 +458,7 @@ def train():
     print('\n  "The only winning move is not to play."\n')
 
     atexit.unregister(save_checkpoint)
-    save_checkpoint()
+    save_checkpoint(sync_model=False)
     return net
 
 

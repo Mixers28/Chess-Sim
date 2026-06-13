@@ -1,12 +1,13 @@
 # Chess-Sim
 
-An AlphaZero-style chess engine with a web UI. Play against the AI in your browser while it continuously learns from self-play in the background.
+An AlphaZero-style chess engine with a web UI. A dedicated trainer owns model updates; the web service is inference-only and records completed human games for later ingestion.
 
 ## How it works
 
 - **Neural network** — 192-channel, 10-block SE-ResNet with three heads: policy (move probabilities), value (position evaluation), and concept (6 interpretable chess concepts).
 - **MCTS** — batched virtual-loss Monte Carlo Tree Search. Multiple simulations run in parallel, all leaf evaluations are batched into one GPU forward pass, then backed up together (~6× faster than sequential).
-- **Self-play** — the engine plays itself continuously in a background thread, generating training data and updating via gradient descent.
+- **Self-play** — `chess_wargames.py` runs on the training machine, generating data and updating the model.
+- **Safe deployment** — benchmarked model generations are copied atomically to the web node and hot-reloaded only between human games.
 - **Concept bottleneck** — an auxiliary head predicts 6 chess concepts (material balance, king safety, piece mobility, pawn structure, space control, tactical threat) from fixed trunk features. Used to generate search-grounded move explanations.
 - **Move explanations** — after each AI move, the top 3 MCTS candidates are compared by Q-value, visit share, and concept deltas. A deterministic sentence explains why the chosen move was preferred.
 - **Elo tracking** — the AI's rating is updated after every human game using the standard Elo formula.
@@ -14,7 +15,7 @@ An AlphaZero-style chess engine with a web UI. Play against the AI in your brows
 ## Project structure
 
 ```
-app.py               FastAPI web server — routes, game state, self-play thread, queue
+app.py               FastAPI web server — inference, game state, queue, hot reload
 chess_model.py       Shared singleton: network, optimizer, replay buffer, Elo, checkpointing
 chess_net.py         AlphaZeroNet architecture (SE-ResBlock tower + policy/value/concept heads)
 chess_mcts.py        Batched virtual-loss MCTS + explain_move_v2 (search-grounded explanation)
@@ -55,7 +56,9 @@ python app.py
 
 Open `http://localhost:8000`. You play as White; the AI plays as Black.
 
-On startup the server loads the latest checkpoint, runs self-play in the background, and saves checkpoints every 50 self-play games or every 10 human games.
+On startup the server loads the latest trainer-owned `model.pt`. It never writes model weights or trains locally. Completed human games update `web_stats.pt` and are exported under `checkpoint/human_games/`.
+
+When an atomically deployed `model.pt` changes, the server waits for the file to remain stable and activates it only when no human game is active.
 
 ### Standalone self-play training (no web UI)
 
@@ -63,7 +66,7 @@ On startup the server loads the latest checkpoint, runs self-play in the backgro
 python chess_wargames.py
 ```
 
-Runs self-play with CLI progress output, saves checkpoints every 50 games.
+Runs self-play with CLI progress output. Local recovery checkpoints are saved every 50 games; a model is deployed only after the 500-game benchmark completes successfully.
 
 ### Pre-training on PGN games
 
@@ -81,16 +84,20 @@ Saved to `checkpoint/` (excluded from git):
 
 | File | Contents | Scope |
 |------|----------|-------|
-| `model.pt` | weights, optimizer, scheduler | shared across machines |
-| `stats.pt` | Elo, game counts | per-machine |
-| `replay_buffer.npz` | up to 20k seed samples | per-machine |
+| `model.pt` | weights, optimizer, scheduler, model generation metadata | trainer-owned, deployed to web |
+| `stats.pt` | trainer game counts | training machine |
+| `web_stats.pt` | human Elo and game counts | web machine |
+| `replay_buffer.npz` | up to 20k seed samples | training machine |
+| `human_games/*.npz` | completed human-game samples | web machine |
 
-To sync `model.pt` to a remote Coolify server after each save:
+To atomically deploy benchmarked models to a remote Coolify volume:
 
 ```bash
 export SYNC_MODEL_TARGET=user@host:/path/checkpoint/model.pt
 export SYNC_MODEL_PORT=22   # optional, default 22
 ```
+
+The trainer uploads to `model.pt.uploading`, verifies it is non-empty, then renames it over `model.pt`. Keep the checkpoint directory mounted into the web container.
 
 ## Docker deployment
 
@@ -99,7 +106,7 @@ docker build -t chess-sim .
 docker run -p 8000:8000 -v ./checkpoint:/app/checkpoint chess-sim
 ```
 
-The image uses CPU-only PyTorch to keep image size manageable. Bind-mount `checkpoint/` so weights persist across container restarts.
+The image uses CPU-only PyTorch to keep image size manageable. Bind-mount `checkpoint/` so model weights, web statistics, and exported human games persist across container restarts.
 
 ## Board encoding
 
@@ -123,10 +130,10 @@ Move indexing: `from_sq * 64 + to_sq` (0–4095). Knight underpromotions use ind
 | `AZ_CHANNELS` | 192 | `chess_model.py` |
 | `AZ_RES_BLOCKS` | 10 | `chess_model.py` |
 | `REPLAY_CAPACITY` | 100,000 | `chess_model.py` |
-| `MCTS_SIMS_SP` | 100 | `app.py` |
-| `MCTS_SIMS_HUMAN` | 50 (GPU) / 10 (CPU) | `app.py` |
-| `MAX_MOVES` | 80 | `chess_wargames.py` |
-| `RESIGN_THRESHOLD` | −0.9 | `chess_wargames.py` |
+| `MCTS_SIMS` | 200 | `chess_wargames.py` |
+| `MCTS_SIMS_HUMAN` | 50 (GPU) / 20 (CPU) | `app.py` |
+| `MAX_MOVES` | 200 | `chess_wargames.py` |
+| `RESIGN_THRESHOLD` | −0.70 | `chess_wargames.py` |
 
 ## API endpoints
 
@@ -141,7 +148,7 @@ Move indexing: `from_sq * 64 + to_sq` (0–4095). Knight underpromotions use ind
 | POST | `/api/move` | Submit a human move (UCI format) |
 | GET | `/api/ai-move` | Request the AI's move + candidates + reasoning |
 | POST | `/api/resign` | Cleanly terminate game (no Elo effect) |
-| GET | `/api/selfplay-stream` | SSE stream of live self-play board positions |
+`/api/stats` includes deployed model metadata: version, training-game count, save timestamp, and self-play generation.
 
 ## Roadmap
 
