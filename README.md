@@ -68,6 +68,33 @@ python chess_wargames.py
 
 Runs self-play with CLI progress output. Local recovery checkpoints are saved every 50 games; a model is deployed only after the 500-game benchmark completes successfully.
 
+### Extended strength evaluation
+
+Run a reproducible 200-game evaluation without deploying the candidate:
+
+```bash
+./tools/run_extended_evaluation.sh checkpoint/model.pt
+```
+
+By default this snapshots the checkpoint and plays 100 games against the heuristic opponent plus 100 against Stockfish skill 1. Reports include White/Black splits, a bootstrapped 95% score confidence interval, estimated Elo difference, model-generation metadata, JSON output, and a text log.
+
+Positions that reach the 120-ply cap are adjudicated as wins or losses when either side leads by at least three pawns of material; otherwise they remain draws. The report records every termination reason and final position.
+
+Progress is atomically saved after every game. Resume an interrupted evaluation with:
+
+```bash
+./tools/run_extended_evaluation.sh --resume benchmark/extended/<report>.json
+```
+
+Runtime can be adjusted with environment variables:
+
+```bash
+GAMES_PER_OPPONENT=200 MCTS_SIMS=100 STOCKFISH_MOVETIME=0.05 \
+  ./tools/run_extended_evaluation.sh checkpoint/model.pt
+```
+
+Results are written under `benchmark/extended/`; immutable candidate snapshots are stored under `benchmark/candidates/`.
+
 ### Pre-training on PGN games
 
 Run once after changing `AZ_CHANNELS` or starting fresh. Requires an elite PGN file (e.g. Lichess elite database).
