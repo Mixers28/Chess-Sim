@@ -39,6 +39,8 @@ device = torch.device(
 # ── Network config ────────────────────────────────────────────────────
 AZ_CHANNELS  = 192
 AZ_RES_BLOCKS = 10
+TRAINING_PIPELINE_VERSION = 2
+REPLAY_SCHEMA_VERSION = 2
 
 # ── Hyperparameters ───────────────────────────────────────────────────
 REPLAY_CAPACITY   = 100_000
@@ -196,6 +198,7 @@ def save_checkpoint(*, sync_model: bool = True) -> None:
             "az_channels":        AZ_CHANNELS,
             "az_res_blocks":      AZ_RES_BLOCKS,
             "az_input_planes":    INPUT_PLANES,
+            "training_pipeline_version": TRAINING_PIPELINE_VERSION,
             "training_games":     total_games,
             "selfplay_games":     selfplay_games,
             "model_saved_at":     saved_at,
@@ -262,6 +265,7 @@ def save_replay_buffer() -> None:
         policies = np.array(p, dtype=np.float16),
         values   = np.array(v, dtype=np.float32),
         concepts = np.array(c, dtype=np.float32),
+        schema_version = np.array(REPLAY_SCHEMA_VERSION, dtype=np.int64),
     )
     print(f"[buffer] Saved {len(buf_list):,} samples → {BUFFER_PATH}")
 
@@ -271,6 +275,13 @@ def load_replay_buffer() -> int:
     if not os.path.exists(BUFFER_PATH):
         return 0
     data = np.load(BUFFER_PATH)
+    schema_version = int(data["schema_version"]) if "schema_version" in data else 0
+    if schema_version != REPLAY_SCHEMA_VERSION:
+        print(
+            "[buffer] Ignoring incompatible replay buffer "
+            f"(schema {schema_version}, expected {REPLAY_SCHEMA_VERSION})"
+        )
+        return 0
     states   = data["states"].astype(np.float32)
     policies = data["policies"].astype(np.float32)
     values   = data["values"]
@@ -313,6 +324,14 @@ def _load_model_weights(path: str, *, load_training_state: bool = True) -> bool:
             ckpt.get("az_res_blocks") != AZ_RES_BLOCKS or
             ckpt.get("az_input_planes") != INPUT_PLANES):
         print("[checkpoint] Architecture mismatch — starting fresh.")
+        return False
+    pipeline_version = int(ckpt.get("training_pipeline_version", 0))
+    if load_training_state and pipeline_version != TRAINING_PIPELINE_VERSION:
+        print(
+            "[checkpoint] Training pipeline mismatch "
+            f"(version {pipeline_version}, expected {TRAINING_PIPELINE_VERSION}) "
+            "— starting a clean generation."
+        )
         return False
     try:
         policy_net.load_state_dict(ckpt["policy_state_dict"], strict=False)

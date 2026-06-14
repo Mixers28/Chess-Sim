@@ -95,6 +95,23 @@ GAMES_PER_OPPONENT=200 MCTS_SIMS=100 STOCKFISH_MOVETIME=0.05 \
 
 Results are written under `benchmark/extended/`; immutable candidate snapshots are stored under `benchmark/candidates/`.
 
+### Training diagnostics
+
+Audit a checkpoint's value-head behaviour and verify that a small network can
+overfit a tiny set of legal positions:
+
+```bash
+./tools/diagnose_training.py --checkpoint checkpoint/model.pt
+```
+
+The command exits non-zero when the checkpoint value head is effectively
+constant or the controlled overfit test fails. Run it before starting a new
+self-play generation and after each major training-pipeline change.
+
+Checkpoints and replay buffers created by the previous self-play pipeline are
+rejected for training. They remain loadable by the inference server, but a new
+training generation must begin with supervised pre-training or fresh weights.
+
 ### Pre-training on PGN games
 
 Run once after changing `AZ_CHANNELS` or starting fresh. Requires an elite PGN file (e.g. Lichess elite database).

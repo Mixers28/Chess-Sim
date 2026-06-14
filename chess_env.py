@@ -15,7 +15,8 @@ Board is encoded as a 19×8×8 tensor:
 Move encoding (ACTION_SIZE = 8192):
   0–4095    : standard moves  (from_square * 64 + to_square)
               queen promotion is implicit for pawns reaching the last rank.
-  4096–8191 : knight underpromotions  (4096 + from_square * 64 + to_square)
+  4096–4239 : compact underpromotions (knight, bishop, rook)
+  4240–8191 : reserved
 """
 
 import math
@@ -24,7 +25,10 @@ import chess
 import numpy as np
 
 INPUT_PLANES = 19
-ACTION_SIZE  = 8192   # 4096 standard + 4096 knight underpromotions
+ACTION_SIZE  = 8192   # 4096 standard + compact underpromotions + reserved space
+_UNDERPROMOTION_OFFSET = 4096
+_UNDERPROMOTION_PIECES = (chess.KNIGHT, chess.BISHOP, chess.ROOK)
+_UNDERPROMOTION_ACTIONS = 2 * 8 * 3 * len(_UNDERPROMOTION_PIECES)
 
 N_CONCEPTS = 6
 CONCEPT_NAMES = [
@@ -214,7 +218,27 @@ def encode(board: chess.Board) -> np.ndarray:
 def move_to_idx(mv: chess.Move) -> int:
     """Encode a chess.Move to an action index (0–8191)."""
     base = mv.from_square * 64 + mv.to_square
-    return 4096 + base if mv.promotion == chess.KNIGHT else base
+    if mv.promotion not in _UNDERPROMOTION_PIECES:
+        return base
+
+    from_rank = chess.square_rank(mv.from_square)
+    to_rank = chess.square_rank(mv.to_square)
+    if from_rank == 6 and to_rank == 7:
+        color_index = 0
+    elif from_rank == 1 and to_rank == 0:
+        color_index = 1
+    else:
+        raise ValueError(f"invalid underpromotion geometry: {mv.uci()}")
+
+    from_file = chess.square_file(mv.from_square)
+    file_delta = chess.square_file(mv.to_square) - from_file
+    if file_delta not in (-1, 0, 1):
+        raise ValueError(f"invalid underpromotion geometry: {mv.uci()}")
+
+    piece_index = _UNDERPROMOTION_PIECES.index(mv.promotion)
+    code = (((color_index * 8 + from_file) * 3 + (file_delta + 1)) * 3
+            + piece_index)
+    return _UNDERPROMOTION_OFFSET + code
 
 
 def legal_mask(board: chess.Board) -> np.ndarray:
@@ -227,11 +251,28 @@ def legal_mask(board: chess.Board) -> np.ndarray:
 
 def idx_to_move(idx: int, board: chess.Board) -> chess.Move | None:
     """Convert an action index back to a legal chess.Move."""
-    if idx >= 4096:
-        base    = idx - 4096
-        from_sq = base >> 6
-        to_sq   = base & 63
-        mv = chess.Move(from_sq, to_sq, promotion=chess.KNIGHT)
+    if idx < 0 or idx >= ACTION_SIZE:
+        return None
+
+    if idx >= _UNDERPROMOTION_OFFSET:
+        code = idx - _UNDERPROMOTION_OFFSET
+        if code >= _UNDERPROMOTION_ACTIONS:
+            return None
+        piece_index = code % 3
+        code //= 3
+        file_delta = code % 3 - 1
+        code //= 3
+        from_file = code % 8
+        color_index = code // 8
+        to_file = from_file + file_delta
+        if not 0 <= to_file < 8:
+            return None
+        from_rank, to_rank = ((6, 7) if color_index == 0 else (1, 0))
+        mv = chess.Move(
+            chess.square(from_file, from_rank),
+            chess.square(to_file, to_rank),
+            promotion=_UNDERPROMOTION_PIECES[piece_index],
+        )
         return mv if mv in board.legal_moves else None
 
     from_sq = idx >> 6
@@ -246,39 +287,41 @@ def idx_to_move(idx: int, board: chess.Board) -> chess.Move | None:
     return mv if mv in board.legal_moves else None
 
 
-def mirror_sample(state: np.ndarray, policy: np.ndarray, value: float):
+def mirror_sample(
+    board: chess.Board,
+    policy: np.ndarray,
+    value: float,
+):
     """
-    Horizontally mirror a training sample (left-right board flip).
+    Mirror a sample vertically while swapping piece colours.
 
-    Chess is symmetric along the vertical axis: a mirrored position is equally
-    valid and provides free 2× training data per game.
+    ``Board.mirror()`` is an exact chess symmetry: ranks are flipped, colours
+    and side-to-move are swapped, and castling/en-passant state stays valid.
+    A left-right file flip is not exact because standard castling is tied to
+    the king's e-file starting square.
 
     Mirror rules:
-      - Board planes: flip file axis (axis=2)
-      - Castling: kingside ↔ queenside planes swap (files reversed after flip)
-      - En passant plane: correctly repositioned by the file flip
-      - Policy: remap from_sq → (from_sq ^ 7), to_sq → (to_sq ^ 7)
-        (XOR with 7 flips the file bits while preserving the rank)
-      - Value: unchanged (symmetric position has the same game value)
+      - Board: python-chess vertical mirror + colour swap
+      - Policy: square_mirror on from/to squares; promotion type unchanged
+      - Value: unchanged because it remains from side-to-move's perspective
     """
-    # Flip all planes along the file axis
-    ms = state[:, :, ::-1].copy()
+    mirrored_board = board.mirror()
+    ms = encode(mirrored_board)
+    # Board transforms do not retain move history, but repetition status is
+    # invariant under this symmetry.
+    ms[18] = encode(board)[18]
 
-    # After the file flip, what was kingside (h-file) is now on the a-file side
-    # (conceptually queenside), so swap the castling rights planes.
-    ms[13], ms[14] = ms[14].copy(), ms[13].copy()   # white K/Q-side
-    ms[15], ms[16] = ms[16].copy(), ms[15].copy()   # black K/Q-side
-
-    # Remap policy: mirror each move index by flipping file bits on both squares
     mp = np.zeros_like(policy)
     for idx in np.nonzero(policy)[0]:
-        idx = int(idx)
-        if idx >= 4096:
-            base     = idx - 4096
-            new_base = (base >> 6 ^ 7) * 64 + (base & 63 ^ 7)
-            mp[4096 + new_base] = policy[idx]
-        else:
-            new_idx = (idx >> 6 ^ 7) * 64 + (idx & 63 ^ 7)
-            mp[new_idx] = policy[idx]
+        mv = idx_to_move(int(idx), board)
+        if mv is None:
+            continue
+        mirrored_move = chess.Move(
+            chess.square_mirror(mv.from_square),
+            chess.square_mirror(mv.to_square),
+            promotion=mv.promotion,
+        )
+        if mirrored_move in mirrored_board.legal_moves:
+            mp[move_to_idx(mirrored_move)] += policy[idx]
 
     return ms, mp, value

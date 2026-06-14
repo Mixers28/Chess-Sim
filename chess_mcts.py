@@ -121,6 +121,16 @@ class MCTS:
         self.c_puct     = c_puct
         self.batch_size = batch_size
 
+    @staticmethod
+    def root_value(root: MCTSNode) -> float:
+        """Return the visit-weighted search value for the root player."""
+        total_visits = sum(child.N for child in root.children.values())
+        if total_visits == 0:
+            return 0.0
+        return sum(
+            child.Q * child.N for child in root.children.values()
+        ) / total_visits
+
     # ── Single-position evaluation (root initialisation only) ─────────
     @torch.no_grad()
     def _evaluate(self, board: chess.Board):

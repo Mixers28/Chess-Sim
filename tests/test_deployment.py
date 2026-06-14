@@ -17,6 +17,33 @@ def test_atomic_torch_save_replaces_complete_file(tmp_path):
     assert not list(tmp_path.glob("stats.pt.tmp.*"))
 
 
+def test_old_training_checkpoint_is_rejected_but_inference_can_load(tmp_path):
+    path = tmp_path / "old-model.pt"
+    torch.save({
+        "policy_state_dict": M.policy_net.state_dict(),
+        "az_channels": M.AZ_CHANNELS,
+        "az_res_blocks": M.AZ_RES_BLOCKS,
+        "az_input_planes": M.INPUT_PLANES,
+    }, path)
+
+    assert M._load_model_weights(str(path), load_training_state=True) is False
+    assert M._load_model_weights(str(path), load_training_state=False) is True
+
+
+def test_old_replay_schema_is_ignored(tmp_path, monkeypatch):
+    path = tmp_path / "replay_buffer.npz"
+    np.savez_compressed(
+        path,
+        states=np.zeros((1, 19, 8, 8), dtype=np.float16),
+        policies=np.zeros((1, 8192), dtype=np.float16),
+        values=np.zeros(1, dtype=np.float32),
+        concepts=np.zeros((1, 6), dtype=np.float32),
+    )
+    monkeypatch.setattr(M, "BUFFER_PATH", str(path))
+
+    assert M.load_replay_buffer() == 0
+
+
 def test_sync_model_uploads_then_atomically_renames(monkeypatch):
     calls = []
 

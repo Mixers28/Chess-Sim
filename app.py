@@ -541,9 +541,10 @@ async def ai_move(player_id: str = Query(...)):
     pv          = mcts.get_pv(new_root, board_snapshot)
     explanation = mcts.explain_move_v2(new_root, board_snapshot, action)
 
-    # Resign if position is hopeless (root Q is from AI/Black's perspective)
+    # Resign if position is hopeless for the AI/Black root player.
     # Only resign if there have been enough moves to form a meaningful position
-    if new_root.Q < RESIGN_THRESHOLD and len(board_snapshot.move_stack) >= 10:
+    if (mcts.root_value(new_root) < RESIGN_THRESHOLD
+            and len(board_snapshot.move_stack) >= 10):
         with game_lock:
             if current_game.active and current_game.outcome is None:
                 _finalize_human_game(ai_resigned=True)

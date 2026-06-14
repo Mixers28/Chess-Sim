@@ -173,7 +173,13 @@ def pretrain(pgn_path: str, max_games: int, batch_size: int, epochs: int) -> Non
         "az_channels":       M.AZ_CHANNELS,
         "az_res_blocks":     M.AZ_RES_BLOCKS,
         "az_input_planes":   INPUT_PLANES,
+        "training_pipeline_version": M.TRAINING_PIPELINE_VERSION,
     }, M.MODEL_PATH)
+    M.total_games = 0
+    M.selfplay_games = 0
+    M.ai_elo = float(M.ELO_DEFAULT_AI)
+    M.elo_history = []
+    M.save_stats()
     print(f"[pretrain] Saved → {M.MODEL_PATH}")
     print("[pretrain] Run chess_wargames.py to begin self-play.\n")
 

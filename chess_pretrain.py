@@ -15,7 +15,7 @@ Usage:
 Each position in each game becomes one training sample:
   state   — 19×8×8 board encoding
   policy  — one-hot on the move actually played (supervised imitation)
-  value   — game outcome from that player's perspective (+1/−0.15/−1)
+  value   — game outcome from that player's perspective (+1/0/−1)
   concepts — auto-labelled strategic scores
 """
 
@@ -38,7 +38,7 @@ from chess_wargames import az_update
 TRAIN_EVERY  = 200    # run gradient updates after every N games parsed
 TRAIN_STEPS  = 10     # gradient steps per training interval
 REPORT_EVERY = 1_000  # print progress every N games
-DRAW_VALUE   = -0.15  # consistent with self-play
+DRAW_VALUE   = 0.0
 
 
 # ── PGN parsing ───────────────────────────────────────────────────────
@@ -138,13 +138,11 @@ def pretrain(pgn_path: str, max_games: int, min_elo: int):
     for game_n, samples in enumerate(
             games_from_pgn(pgn_path, max_games, min_elo), start=1):
 
-        # Push original + horizontally mirrored samples
+        # Push original + exact colour/rank-mirrored samples
         for state, policy, value, concepts, board_copy in samples:
             buf.push(state, policy, value, concepts)
-            ms, mp, mv = mirror_sample(state, policy, value)
-            mirrored_concepts = compute_concept_labels(
-                board_copy.transform(chess.flip_horizontal)
-            )
+            ms, mp, mv = mirror_sample(board_copy, policy, value)
+            mirrored_concepts = compute_concept_labels(board_copy.mirror())
             buf.push(ms, mp, mv, mirrored_concepts)
             total_samples += 2
 

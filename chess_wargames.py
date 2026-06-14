@@ -27,7 +27,7 @@ import torch.nn.functional as F
 
 import chess_model as M
 from chess_model import save_checkpoint, load_checkpoint
-from chess_env import encode, idx_to_move, mirror_sample, compute_concept_labels, _PIECE_VALUES
+from chess_env import encode, idx_to_move, mirror_sample, compute_concept_labels
 from chess_mcts import MCTS
 from chess_net import AlphaZeroNet
 
@@ -39,7 +39,6 @@ TRAIN_STEPS  = 5          # gradient steps after each game
 MCTS_SIMS    = 200        # simulations per move during self-play
 MCTS_BATCH   = 64         # leaf nodes evaluated per GPU forward pass
 MAX_MOVES    = 200        # half-moves per game cap
-MATERIAL_WIN = 6          # material advantage (in pawns) treated as decisive win
 SAVE_EVERY   = 50         # games between checkpoint saves
 
 # Periodic fixed-opponent benchmark (objective strength tracking)
@@ -212,12 +211,8 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
         temp = max(0.05, math.exp(-move_n / TEMP_DECAY))
         action, counts, root = mcts.get_policy(board, temperature=temp, add_noise=True)
 
-        # Compute root value from MCTS tree (weighted avg of children Q, negated)
-        total_n = sum(c.N for c in root.children.values())
-        if total_n > 0:
-            root_value = -sum(c.Q * c.N for c in root.children.values()) / total_n
-        else:
-            root_value = 0.0
+        # Child Q values are stored from the root player's perspective.
+        root_value = mcts.root_value(root)
 
         # Resign check — activates naturally once value head produces values near ±1
         if root_value < RESIGN_THRESHOLD:
@@ -244,22 +239,7 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
         if position_cb is not None:
             position_cb(board.fen(), mv.uci(), move_n)
 
-        # Material termination: queen-level imbalance treated as decisive
-        mat_w = sum(_PIECE_VALUES[p.piece_type]
-                    for p in board.piece_map().values() if p.color == chess.WHITE)
-        mat_b = sum(_PIECE_VALUES[p.piece_type]
-                    for p in board.piece_map().values() if p.color == chess.BLACK)
-        if abs(mat_w - mat_b) >= MATERIAL_WIN:
-            winner = chess.WHITE if mat_w > mat_b else chess.BLACK
-            result = "W" if winner == chess.WHITE else "B"
-            samples = []
-            for state, policy, color, concepts, board_copy in records:
-                v = 1.0 if color == winner else -1.0
-                samples.append((state, policy, v, concepts, board_copy))
-            return samples, result, move_n
-
     # Determine outcome
-    capped = False
     if resigned:
         # Current player to move lost (they gave up)
         result = "B" if board.turn == chess.WHITE else "W"
@@ -267,7 +247,7 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
     else:
         outcome = board.outcome()
         if outcome is None:
-            result, winner, capped = "D", None, True   # hit MAX_MOVES
+            result, winner = "D", None   # hit MAX_MOVES
         elif outcome.winner == chess.WHITE:
             result, winner = "W", chess.WHITE
         elif outcome.winner == chess.BLACK:
@@ -276,14 +256,9 @@ def selfplay_game(board: chess.Board, mcts: MCTS, position_cb=None):
             result, winner = "D", None
 
     # Build training samples: fill in value_target from each player's perspective.
-    # Genuine draws (stalemate, repetition, etc.) are worth 0; the mild negative
-    # label applies only to games cut off by the move cap, to discourage stalling.
     samples = []
     for state, policy, color, concepts, board_copy in records:
-        if winner is None:
-            v = -0.15 if capped else 0.0
-        else:
-            v = 1.0 if color == winner else -1.0
+        v = 0.0 if winner is None else (1.0 if color == winner else -1.0)
         samples.append((state, policy, v, concepts, board_copy))
 
     return samples, result, move_n
@@ -321,8 +296,8 @@ def _play_game(state_dict_cpu):
     processed = []
     for state, policy, value, concepts, board_copy in raw_samples:
         processed.append((state, policy, value, concepts))
-        ms, mp_arr, mv = mirror_sample(state, policy, value)
-        mc = compute_concept_labels(board_copy.transform(chess.flip_horizontal))
+        ms, mp_arr, mv = mirror_sample(board_copy, policy, value)
+        mc = compute_concept_labels(board_copy.mirror())
         processed.append((ms, mp_arr, mv, mc))
     return processed, result, n_moves
 

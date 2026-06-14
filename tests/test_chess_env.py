@@ -6,10 +6,8 @@ Run with:
 
 Encoding contract (ACTION_SIZE = 8192):
   0–4095    : standard moves + queen promotions (implicit)
-  4096–8191 : knight underpromotions
-  Note: rook and bishop underpromotions share the queen promotion index.
-        Supporting them distinctly would require expanding ACTION_SIZE and
-        retraining the policy head. Deferred until a model reset.
+  4096–4239 : compact knight, bishop, and rook underpromotions
+  4240–8191 : reserved
 """
 
 import chess
@@ -40,16 +38,21 @@ class TestMoveToIdx:
         idx = move_to_idx(mv)
         assert 4096 <= idx < 8192
 
-    def test_rook_promotion_maps_to_standard_range(self):
-        # Rook promotion shares the queen promotion index (by design).
+    def test_rook_underpromotion_has_distinct_index(self):
         q_idx = move_to_idx(chess.Move.from_uci("a7a8q"))
         r_idx = move_to_idx(chess.Move.from_uci("a7a8r"))
-        assert r_idx == q_idx
+        assert 4096 <= r_idx < ACTION_SIZE
+        assert r_idx != q_idx
 
-    def test_bishop_promotion_maps_to_standard_range(self):
+    def test_bishop_underpromotion_has_distinct_index(self):
         q_idx = move_to_idx(chess.Move.from_uci("a7a8q"))
         b_idx = move_to_idx(chess.Move.from_uci("a7a8b"))
-        assert b_idx == q_idx
+        assert 4096 <= b_idx < ACTION_SIZE
+        assert b_idx != q_idx
+
+    def test_all_promotion_types_have_unique_indices(self):
+        moves = [chess.Move.from_uci(f"a7a8{piece}") for piece in "qrbn"]
+        assert len({move_to_idx(move) for move in moves}) == 4
 
     def test_all_starting_moves_have_valid_indices(self):
         board = chess.Board()
@@ -65,10 +68,12 @@ class TestMoveToIdx:
         mv = chess.Move(chess.E2, chess.E4)
         assert move_to_idx(mv) == chess.E2 * 64 + chess.E4
 
-    def test_knight_underpromotion_formula(self):
-        mv = chess.Move.from_uci("a7a8n")
-        base = chess.A7 * 64 + chess.A8
-        assert move_to_idx(mv) == 4096 + base
+    def test_underpromotion_indices_use_compact_range(self):
+        indices = [
+            move_to_idx(chess.Move.from_uci(f"a7a8{piece}"))
+            for piece in "nbr"
+        ]
+        assert indices == [4099, 4100, 4101]
 
 
 class TestIdxToMove:
@@ -87,6 +92,18 @@ class TestIdxToMove:
     def test_knight_underpromotion_roundtrip(self):
         board = chess.Board("8/P7/8/8/8/8/8/8 w - - 0 1")
         mv = chess.Move.from_uci("a7a8n")
+        assert idx_to_move(move_to_idx(mv), board) == mv
+
+    @pytest.mark.parametrize("piece", ["n", "b", "r"])
+    def test_all_underpromotions_roundtrip(self, piece):
+        board = chess.Board("8/P7/8/8/8/8/8/8 w - - 0 1")
+        mv = chess.Move.from_uci(f"a7a8{piece}")
+        assert idx_to_move(move_to_idx(mv), board) == mv
+
+    @pytest.mark.parametrize("piece", ["n", "b", "r"])
+    def test_black_underpromotions_roundtrip(self, piece):
+        board = chess.Board("8/8/8/8/8/8/p7/8 b - - 0 1")
+        mv = chess.Move.from_uci(f"a2a1{piece}")
         assert idx_to_move(move_to_idx(mv), board) == mv
 
     def test_illegal_move_returns_none(self):
@@ -144,8 +161,9 @@ class TestLegalMask:
     def test_promotion_position_has_queen_and_knight(self):
         board = chess.Board("8/P7/8/8/8/8/8/8 w - - 0 1")
         mask = legal_mask(board)
-        assert mask[move_to_idx(chess.Move.from_uci("a7a8q"))] == 1.0
-        assert mask[move_to_idx(chess.Move.from_uci("a7a8n"))] == 1.0
+        for piece in "qrbn":
+            assert mask[move_to_idx(chess.Move.from_uci(f"a7a8{piece}"))] == 1.0
+        assert int(mask.sum()) == len(list(board.legal_moves))
 
     def test_castling_moves_in_mask(self):
         board = chess.Board("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1")
@@ -173,21 +191,19 @@ class TestMirrorSample:
     def test_policy_sum_preserved(self):
         board = chess.Board()
         policy = self._make_uniform_policy(board)
-        _, mp, _ = mirror_sample(encode(board), policy, 1.0)
+        _, mp, _ = mirror_sample(board, policy, 1.0)
         np.testing.assert_allclose(mp.sum(), policy.sum(), rtol=1e-5)
 
     def test_value_unchanged(self):
-        _, _, mv = mirror_sample(
-            np.zeros((INPUT_PLANES, 8, 8)), np.zeros(ACTION_SIZE), 0.75
-        )
+        _, _, mv = mirror_sample(chess.Board(), np.zeros(ACTION_SIZE), 0.75)
         assert mv == 0.75
 
     def test_mirrored_moves_are_legal_on_mirrored_board(self):
         board = chess.Board()
         policy = self._make_uniform_policy(board)
-        _, mp, _ = mirror_sample(encode(board), policy, 1.0)
+        _, mp, _ = mirror_sample(board, policy, 1.0)
 
-        mirrored_board = board.transform(chess.flip_horizontal)
+        mirrored_board = board.mirror()
         mirrored_mask  = legal_mask(mirrored_board)
         for idx in np.nonzero(mp)[0]:
             assert mirrored_mask[idx] == 1.0, (
@@ -197,25 +213,32 @@ class TestMirrorSample:
     def test_double_mirror_recovers_original_policy(self):
         board = chess.Board()
         policy = self._make_uniform_policy(board)
-        state  = encode(board)
-        ms, mp, _ = mirror_sample(state, policy, 1.0)
-        ms2, mp2, _ = mirror_sample(ms, mp, 1.0)
+        ms, mp, _ = mirror_sample(board, policy, 1.0)
+        ms2, mp2, _ = mirror_sample(board.mirror(), mp, 1.0)
+        np.testing.assert_allclose(ms2, encode(board), atol=1e-6)
         np.testing.assert_allclose(mp2, policy, atol=1e-6)
 
     def test_state_shape_preserved(self):
-        state = encode(chess.Board())
-        ms, _, _ = mirror_sample(state, np.zeros(ACTION_SIZE), 0.0)
-        assert ms.shape == state.shape
-
-    def test_castling_planes_swapped(self):
         board = chess.Board()
-        state = encode(board)
-        ms, _, _ = mirror_sample(state, np.zeros(ACTION_SIZE), 0.0)
-        # Kingside and queenside planes should be swapped after mirror
-        np.testing.assert_array_equal(ms[13], state[14, :, ::-1])
-        np.testing.assert_array_equal(ms[14], state[13, :, ::-1])
-        np.testing.assert_array_equal(ms[15], state[16, :, ::-1])
-        np.testing.assert_array_equal(ms[16], state[15, :, ::-1])
+        ms, _, _ = mirror_sample(board, np.zeros(ACTION_SIZE), 0.0)
+        assert ms.shape == encode(board).shape
+
+    def test_castling_state_remains_valid(self):
+        board = chess.Board()
+        ms, _, _ = mirror_sample(board, np.zeros(ACTION_SIZE), 0.0)
+        np.testing.assert_array_equal(ms, encode(board.mirror()))
+
+    def test_castling_policy_maps_to_legal_castling_move(self):
+        board = chess.Board("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1")
+        policy = np.zeros(ACTION_SIZE, dtype=np.float32)
+        policy[move_to_idx(chess.Move.from_uci("e1g1"))] = 1.0
+
+        _, mirrored_policy, _ = mirror_sample(board, policy, 1.0)
+        mirrored_board = board.mirror()
+        mirrored_move = chess.Move.from_uci("e8g8")
+
+        assert mirrored_move in mirrored_board.legal_moves
+        assert mirrored_policy[move_to_idx(mirrored_move)] == 1.0
 
 
 # ── Board encoding ────────────────────────────────────────────────────────────
