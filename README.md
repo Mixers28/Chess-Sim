@@ -108,6 +108,26 @@ The command exits non-zero when the checkpoint value head is effectively
 constant or the controlled overfit test fails. Run it before starting a new
 self-play generation and after each major training-pipeline change.
 
+Measure immediate mate recognition and KQ/KR-versus-king conversion without
+material adjudication:
+
+```bash
+./tools/diagnose_endgames.py --checkpoint checkpoint/model.pt
+```
+
+Generate a compact targeted buffer of exact mates and Stockfish conversion
+trajectories:
+
+```bash
+./tools/generate_endgame_expert.py --samples 20000
+```
+
+The trainer automatically includes `checkpoint/endgame_expert.npz` in the
+expert share on its next start. By default, targeted samples occupy half of the
+25% expert allocation, so each batch remains 75% self-play, 12.5% general
+expert, and 12.5% tactical/endgame. Override with
+`ENDGAME_WITHIN_EXPERT_FRAC`.
+
 Checkpoints and replay buffers created by the previous self-play pipeline are
 rejected for training. They remain loadable by the inference server, but a new
 training generation must begin with supervised pre-training or fresh weights.

@@ -28,6 +28,7 @@ def test_mixed_batch_uses_requested_expert_fraction(monkeypatch):
         np.zeros((8, 6), dtype=np.float32),
     )
     monkeypatch.setattr(M, "expert_buf", expert)
+    monkeypatch.setattr(M, "endgame_buf", M.ExpertReplayBuffer())
     random.seed(3)
     np.random.seed(3)
 
@@ -46,6 +47,7 @@ def test_sampler_falls_back_to_selfplay(monkeypatch):
     for _ in range(4):
         selfplay.push(*_sample(0.0))
     monkeypatch.setattr(M, "expert_buf", M.ExpertReplayBuffer())
+    monkeypatch.setattr(M, "endgame_buf", M.ExpertReplayBuffer())
 
     batch = M.sample_training_batch(selfplay, batch_size=4)
 
@@ -62,6 +64,7 @@ def test_sampler_supports_expert_only_batches(monkeypatch):
         np.zeros((4, 6), dtype=np.float32),
     )
     monkeypatch.setattr(M, "expert_buf", expert)
+    monkeypatch.setattr(M, "endgame_buf", M.ExpertReplayBuffer())
 
     batch = M.sample_training_batch(
         M.AZReplayBuffer(1),
@@ -98,7 +101,9 @@ def test_legacy_expert_file_is_compacted_and_cached(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(M, "EXPERT_BUF_PATH", str(source))
     monkeypatch.setattr(M, "EXPERT_COMPACT_PATH", str(compact))
+    monkeypatch.setattr(M, "ENDGAME_EXPERT_PATH", str(tmp_path / "missing.npz"))
     monkeypatch.setattr(M, "expert_buf", M.ExpertReplayBuffer())
+    monkeypatch.setattr(M, "endgame_buf", M.ExpertReplayBuffer())
 
     assert M.load_expert_buffer() == 1
     assert compact.exists()
@@ -112,3 +117,56 @@ def test_legacy_expert_file_is_compacted_and_cached(tmp_path, monkeypatch):
         lambda source_stat: pytest.fail("compact cache should be reused"),
     )
     assert M.load_expert_buffer() == 1
+
+
+def test_optional_endgame_buffer_is_appended(tmp_path, monkeypatch):
+    endgame = tmp_path / "endgame_expert.npz"
+    np.savez_compressed(
+        endgame,
+        states=np.zeros((2, INPUT_PLANES, 8, 8), dtype=np.float16),
+        actions=np.array([1, 2], dtype=np.int32),
+        values=np.array([1.0, -1.0], dtype=np.float32),
+        concepts=np.zeros((2, 6), dtype=np.float32),
+        schema_version=np.array(M.EXPERT_SCHEMA_VERSION, dtype=np.int64),
+    )
+    monkeypatch.setattr(M, "EXPERT_BUF_PATH", str(tmp_path / "missing.npz"))
+    monkeypatch.setattr(M, "ENDGAME_EXPERT_PATH", str(endgame))
+    monkeypatch.setattr(M, "expert_buf", M.ExpertReplayBuffer())
+    monkeypatch.setattr(M, "endgame_buf", M.ExpertReplayBuffer())
+
+    assert M.load_expert_buffer() == 2
+    assert M.endgame_buf.actions.tolist() == [1, 2]
+
+
+def test_endgame_samples_are_stratified_within_expert_share(monkeypatch):
+    selfplay = M.AZReplayBuffer(32)
+    for _ in range(16):
+        selfplay.push(*_sample(0.0))
+
+    general = M.ExpertReplayBuffer()
+    general.load(
+        np.zeros((8, INPUT_PLANES, 8, 8), dtype=np.float16),
+        np.ones(8, dtype=np.int32),
+        np.full(8, 0.5, dtype=np.float32),
+        np.zeros((8, 6), dtype=np.float32),
+    )
+    endgame = M.ExpertReplayBuffer()
+    endgame.load(
+        np.zeros((8, INPUT_PLANES, 8, 8), dtype=np.float16),
+        np.full(8, 2, dtype=np.int32),
+        np.ones(8, dtype=np.float32),
+        np.zeros((8, 6), dtype=np.float32),
+    )
+    monkeypatch.setattr(M, "expert_buf", general)
+    monkeypatch.setattr(M, "endgame_buf", endgame)
+    monkeypatch.setattr(M, "ENDGAME_WITHIN_EXPERT_FRAC", 0.5)
+
+    _, policies, values, _ = M.sample_training_batch(
+        selfplay,
+        batch_size=8,
+        expert_frac=0.5,
+    )
+
+    assert int((values == 0.5).sum()) == 2
+    assert int((values == 1.0).sum()) == 2
+    assert int((policies[:, 2] == 1.0).sum()) == 2

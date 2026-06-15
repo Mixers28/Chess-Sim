@@ -59,15 +59,21 @@ STATS_PATH      = os.path.join(CHECKPOINT_DIR, "stats.pt")       # Elo/counts (l
 BUFFER_PATH     = os.path.join(CHECKPOINT_DIR, "replay_buffer.npz")
 EXPERT_BUF_PATH = os.path.join(CHECKPOINT_DIR, "expert_buffer.npz")  # Stockfish-labeled
 EXPERT_COMPACT_PATH = os.path.join(CHECKPOINT_DIR, "expert_buffer.compact.npz")
+ENDGAME_EXPERT_PATH = os.path.join(CHECKPOINT_DIR, "endgame_expert.npz")
 BUFFER_SEED_SIZE = 20_000   # max samples persisted across restarts
 
 # Fraction of each training batch drawn from the non-evictable expert buffer.
 # Stockfish evaluations provide dense non-zero value targets while elite human
 # moves anchor the policy head when self-play is dominated by capped draws.
 EXPERT_BATCH_FRAC = float(os.environ.get("EXPERT_BATCH_FRAC", "0.25"))
+ENDGAME_WITHIN_EXPERT_FRAC = float(
+    os.environ.get("ENDGAME_WITHIN_EXPERT_FRAC", "0.50")
+)
 EXPERT_SCHEMA_VERSION = 2
 if not 0.0 <= EXPERT_BATCH_FRAC <= 1.0:
     raise ValueError("EXPERT_BATCH_FRAC must be between 0 and 1")
+if not 0.0 <= ENDGAME_WITHIN_EXPERT_FRAC <= 1.0:
+    raise ValueError("ENDGAME_WITHIN_EXPERT_FRAC must be between 0 and 1")
 
 # Optional: set to deploy benchmarked model generations to the inference host
 # e.g. export SYNC_MODEL_TARGET=user@server:/data/chess-sim/checkpoint/model.pt
@@ -145,6 +151,15 @@ class ExpertReplayBuffer:
         self.values = values
         self.concepts = concepts
 
+    def append(self, states, actions, values, concepts) -> None:
+        if len(self) == 0:
+            self.load(states, actions, values, concepts)
+            return
+        self.states = np.concatenate((self.states, states))
+        self.actions = np.concatenate((self.actions, actions))
+        self.values = np.concatenate((self.values, values))
+        self.concepts = np.concatenate((self.concepts, concepts))
+
     def sample(self, n: int):
         indices = np.asarray(random.sample(range(len(self)), n), dtype=np.int64)
         policies = np.zeros((n, ACTION_SIZE), dtype=np.float32)
@@ -161,6 +176,7 @@ class ExpertReplayBuffer:
 
 
 expert_buf = ExpertReplayBuffer()
+endgame_buf = ExpertReplayBuffer()
 
 
 def _tensorize(s, p, v, c):
@@ -189,7 +205,8 @@ def sample_training_batch(
     """
     if not 0.0 <= expert_frac <= 1.0:
         raise ValueError("expert_frac must be between 0 and 1")
-    n_expert = min(int(batch_size * expert_frac), len(expert_buf))
+    available_expert = len(expert_buf) + len(endgame_buf)
+    n_expert = min(int(batch_size * expert_frac), available_expert)
     n_self   = batch_size - n_expert
     if len(selfplay_buffer) < n_self:
         return None
@@ -204,19 +221,35 @@ def sample_training_batch(
         concepts = np.asarray(c)
 
     if n_expert:
-        expert_states, expert_policies, expert_values, expert_concepts = (
-            expert_buf.sample(n_expert)
+        n_endgame = min(
+            round(n_expert * ENDGAME_WITHIN_EXPERT_FRAC),
+            len(endgame_buf),
         )
-        if states is None:
-            states = expert_states
-            policies = expert_policies
-            values = expert_values
-            concepts = expert_concepts
-        else:
-            states = np.concatenate((states, expert_states))
-            policies = np.concatenate((policies, expert_policies))
-            values = np.concatenate((values, expert_values))
-            concepts = np.concatenate((concepts, expert_concepts))
+        n_general = min(n_expert - n_endgame, len(expert_buf))
+        remaining = n_expert - n_endgame - n_general
+        if remaining:
+            extra_endgame = min(remaining, len(endgame_buf) - n_endgame)
+            n_endgame += extra_endgame
+            remaining -= extra_endgame
+        if remaining:
+            n_general += min(remaining, len(expert_buf) - n_general)
+
+        expert_parts = []
+        if n_general:
+            expert_parts.append(expert_buf.sample(n_general))
+        if n_endgame:
+            expert_parts.append(endgame_buf.sample(n_endgame))
+        for expert_states, expert_policies, expert_values, expert_concepts in expert_parts:
+            if states is None:
+                states = expert_states
+                policies = expert_policies
+                values = expert_values
+                concepts = expert_concepts
+            else:
+                states = np.concatenate((states, expert_states))
+                policies = np.concatenate((policies, expert_policies))
+                values = np.concatenate((values, expert_values))
+                concepts = np.concatenate((concepts, expert_concepts))
 
     order = np.random.permutation(batch_size)
     return _tensorize(
@@ -315,16 +348,49 @@ def _convert_expert_buffer(source_stat: os.stat_result) -> None:
 
 def load_expert_buffer() -> int:
     """Load Stockfish-labeled samples into the non-evictable expert buffer."""
+    expert_buf.load(
+        np.empty((0, INPUT_PLANES, 8, 8), dtype=np.float16),
+        np.empty(0, dtype=np.int32),
+        np.empty(0, dtype=np.float32),
+        np.empty((0, 0), dtype=np.float32),
+    )
+    endgame_buf.load(
+        np.empty((0, INPUT_PLANES, 8, 8), dtype=np.float16),
+        np.empty(0, dtype=np.int32),
+        np.empty(0, dtype=np.float32),
+        np.empty((0, 0), dtype=np.float32),
+    )
     if not os.path.exists(EXPERT_BUF_PATH):
         print("[expert] No expert buffer found — training on self-play only.")
-        return 0
-    source_stat = os.stat(EXPERT_BUF_PATH)
-    if not _load_compact_expert_buffer(source_stat):
-        print("[expert] Converting legacy dense expert buffer to compact format...")
-        _convert_expert_buffer(source_stat)
-    print(f"[expert] Loaded {len(expert_buf):,} expert samples (non-evictable, "
+    else:
+        source_stat = os.stat(EXPERT_BUF_PATH)
+        if not _load_compact_expert_buffer(source_stat):
+            print("[expert] Converting legacy dense expert buffer to compact format...")
+            _convert_expert_buffer(source_stat)
+
+    if os.path.exists(ENDGAME_EXPERT_PATH):
+        data = np.load(ENDGAME_EXPERT_PATH)
+        if int(data.get("schema_version", 0)) != EXPERT_SCHEMA_VERSION:
+            raise ValueError("endgame expert buffer has incompatible schema")
+        states = data["states"]
+        actions = data["actions"].astype(np.int32)
+        values = data["values"].astype(np.float32)
+        concepts = data["concepts"].astype(np.float32)
+        if (
+            states.shape[0] != len(actions)
+            or len(actions) != len(values)
+            or concepts.shape[0] != len(actions)
+            or np.any(actions < 0)
+            or np.any(actions >= ACTION_SIZE)
+        ):
+            raise ValueError("endgame expert buffer arrays are incompatible")
+        endgame_buf.load(states, actions, values, concepts)
+        print(f"[expert] Added {len(actions):,} tactical/endgame samples")
+
+    total_expert = len(expert_buf) + len(endgame_buf)
+    print(f"[expert] Loaded {total_expert:,} expert samples (non-evictable, "
           f"{EXPERT_BATCH_FRAC:.0%} of each batch)")
-    return len(expert_buf)
+    return total_expert
 
 # ── Training state ────────────────────────────────────────────────────
 total_games    = 0
