@@ -77,7 +77,57 @@ def audit_checkpoint(path):
         "positions": rows,
         "value_std": round(float(value_array.std()), 6),
         "value_range": round(float(value_array.max() - value_array.min()), 6),
-        "value_head_collapsed": bool(value_array.std() < 0.02),
+        "probe_value_head_flat": bool(value_array.std() < 0.02),
+    }
+
+
+@torch.no_grad()
+def audit_replay(net, replay_path, sample_size=2048):
+    data = np.load(replay_path)
+    total = len(data["values"])
+    rng = np.random.default_rng(7)
+    indices = rng.choice(total, size=min(sample_size, total), replace=False)
+    states = data["states"][indices].astype(np.float32)
+    targets = data["values"][indices].astype(np.float32)
+
+    predictions = []
+    for start in range(0, len(states), 128):
+        batch = torch.tensor(states[start:start + 128], dtype=torch.float32)
+        predictions.append(net(batch)[1].numpy())
+    predictions = np.concatenate(predictions)
+
+    target_std = float(targets.std())
+    prediction_std = float(predictions.std())
+    correlation = (
+        float(np.corrcoef(predictions, targets)[0, 1])
+        if target_std > 0 and prediction_std > 0
+        else 0.0
+    )
+    by_target = {}
+    for target in (-1.0, 0.0, 1.0):
+        selected = predictions[targets == target]
+        by_target[str(int(target))] = {
+            "count": int(len(selected)),
+            "prediction_mean": (
+                round(float(selected.mean()), 4) if len(selected) else None
+            ),
+        }
+
+    return {
+        "path": replay_path,
+        "samples": int(len(targets)),
+        "target_std": round(target_std, 6),
+        "prediction_std": round(prediction_std, 6),
+        "prediction_range": [
+            round(float(predictions.min()), 4),
+            round(float(predictions.max()), 4),
+        ],
+        "correlation": round(correlation, 4),
+        "value_mae": round(float(np.abs(predictions - targets).mean()), 4),
+        "by_target": by_target,
+        "value_head_collapsed": bool(
+            prediction_std < 0.02 or abs(correlation) < 0.05
+        ),
     }
 
 
@@ -143,13 +193,21 @@ def main():
         "--checkpoint",
         default=os.path.join(ROOT_DIR, "checkpoint", "model.pt"),
     )
+    parser.add_argument(
+        "--replay",
+        default=os.path.join(ROOT_DIR, "checkpoint", "replay_buffer.npz"),
+    )
     parser.add_argument("--overfit-steps", type=int, default=250)
     parser.add_argument("--skip-overfit", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    report = {"checkpoint": audit_checkpoint(args.checkpoint)}
+    _, net = load_checkpoint(args.checkpoint)
+    checkpoint_report = audit_checkpoint(args.checkpoint)
+    report = {"checkpoint": checkpoint_report}
+    if args.replay and os.path.exists(args.replay):
+        report["replay"] = audit_replay(net, args.replay)
     if not args.skip_overfit:
         report["overfit"] = run_overfit(args.overfit_steps, device)
 
@@ -170,9 +228,23 @@ def main():
             f"range={checkpoint['value_range']:.6f}"
         )
         print(
-            "  checkpoint value head: "
-            + ("COLLAPSED" if checkpoint["value_head_collapsed"] else "varied")
+            "  synthetic probe: "
+            + ("flat" if checkpoint["probe_value_head_flat"] else "varied")
         )
+        if "replay" in report:
+            replay = report["replay"]
+            print("\nReplay audit")
+            print(
+                f"  samples={replay['samples']} "
+                f"prediction_std={replay['prediction_std']:.4f} "
+                f"range={replay['prediction_range']} "
+                f"correlation={replay['correlation']:.4f} "
+                f"value_mae={replay['value_mae']:.4f}"
+            )
+            print(
+                "  replay value head: "
+                + ("COLLAPSED" if replay["value_head_collapsed"] else "varied")
+            )
         if "overfit" in report:
             overfit = report["overfit"]
             print("\nTiny-dataset overfit")
@@ -184,7 +256,10 @@ def main():
             )
             print("  training path: " + ("PASS" if overfit["passed"] else "FAIL"))
 
-    failed = report["checkpoint"]["value_head_collapsed"]
+    if "replay" in report:
+        failed = report["replay"]["value_head_collapsed"]
+    else:
+        failed = report["checkpoint"]["probe_value_head_flat"]
     failed = failed or not report.get("overfit", {"passed": True})["passed"]
     raise SystemExit(1 if failed else 0)
 
