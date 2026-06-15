@@ -21,13 +21,14 @@ import threading
 from datetime import datetime, timezone
 from collections import deque
 
+import chess
 import numpy as np
 import torch
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_sched
 
 from chess_net import AlphaZeroNet
-from chess_env import INPUT_PLANES
+from chess_env import ACTION_SIZE, INPUT_PLANES
 
 # ── Device ────────────────────────────────────────────────────────────
 device = torch.device(
@@ -56,7 +57,17 @@ CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "checkpoint.pt")  # legacy
 MODEL_PATH      = os.path.join(CHECKPOINT_DIR, "model.pt")       # weights (shared)
 STATS_PATH      = os.path.join(CHECKPOINT_DIR, "stats.pt")       # Elo/counts (local)
 BUFFER_PATH     = os.path.join(CHECKPOINT_DIR, "replay_buffer.npz")
+EXPERT_BUF_PATH = os.path.join(CHECKPOINT_DIR, "expert_buffer.npz")  # Stockfish-labeled
+EXPERT_COMPACT_PATH = os.path.join(CHECKPOINT_DIR, "expert_buffer.compact.npz")
 BUFFER_SEED_SIZE = 20_000   # max samples persisted across restarts
+
+# Fraction of each training batch drawn from the non-evictable expert buffer.
+# Stockfish evaluations provide dense non-zero value targets while elite human
+# moves anchor the policy head when self-play is dominated by capped draws.
+EXPERT_BATCH_FRAC = float(os.environ.get("EXPERT_BATCH_FRAC", "0.25"))
+EXPERT_SCHEMA_VERSION = 2
+if not 0.0 <= EXPERT_BATCH_FRAC <= 1.0:
+    raise ValueError("EXPERT_BATCH_FRAC must be between 0 and 1")
 
 # Optional: set to deploy benchmarked model generations to the inference host
 # e.g. export SYNC_MODEL_TARGET=user@server:/data/chess-sim/checkpoint/model.pt
@@ -88,7 +99,7 @@ n_params = sum(p.numel() for p in policy_net.parameters())
 class AZReplayBuffer:
     """Stores (state, policy_target, value_target, concept_labels) tuples."""
 
-    def __init__(self, capacity: int = REPLAY_CAPACITY):
+    def __init__(self, capacity: int | None = REPLAY_CAPACITY):
         self.buf = deque(maxlen=capacity)
 
     def push(self,
@@ -117,6 +128,203 @@ class AZReplayBuffer:
 
 
 replay_buf = AZReplayBuffer(REPLAY_CAPACITY)
+
+
+class ExpertReplayBuffer:
+    """Compact, non-evictable expert samples with one action per position."""
+
+    def __init__(self):
+        self.states = np.empty((0, INPUT_PLANES, 8, 8), dtype=np.float16)
+        self.actions = np.empty(0, dtype=np.int32)
+        self.values = np.empty(0, dtype=np.float32)
+        self.concepts = np.empty((0, 0), dtype=np.float32)
+
+    def load(self, states, actions, values, concepts) -> None:
+        self.states = states
+        self.actions = actions
+        self.values = values
+        self.concepts = concepts
+
+    def sample(self, n: int):
+        indices = np.asarray(random.sample(range(len(self)), n), dtype=np.int64)
+        policies = np.zeros((n, ACTION_SIZE), dtype=np.float32)
+        policies[np.arange(n), self.actions[indices]] = 1.0
+        return (
+            self.states[indices],
+            policies,
+            self.values[indices],
+            self.concepts[indices],
+        )
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+
+expert_buf = ExpertReplayBuffer()
+
+
+def _tensorize(s, p, v, c):
+    """Stack raw sample tuples into device tensors (robust to legacy None concepts)."""
+    states   = torch.tensor(np.array(s), dtype=torch.float32).to(device)
+    policies = torch.tensor(np.array(p), dtype=torch.float32).to(device)
+    values   = torch.tensor(v,           dtype=torch.float32).to(device)
+    if any(x is None for x in c):
+        from chess_env import N_CONCEPTS
+        c = [np.zeros(N_CONCEPTS, dtype=np.float32) if x is None else x for x in c]
+    concepts = torch.tensor(np.array(c), dtype=torch.float32).to(device)
+    return states, policies, values, concepts
+
+
+def sample_training_batch(
+    selfplay_buffer: AZReplayBuffer,
+    batch_size: int,
+    expert_frac: float = EXPERT_BATCH_FRAC,
+):
+    """
+    Build a training batch mixing self-play data with non-evictable expert data.
+
+    The expert share supplies engine-evaluated value targets and elite human
+    policy targets. Falls back to pure self-play when no expert data is loaded.
+    Returns None until the self-play buffer can fill its share of the batch.
+    """
+    if not 0.0 <= expert_frac <= 1.0:
+        raise ValueError("expert_frac must be between 0 and 1")
+    n_expert = min(int(batch_size * expert_frac), len(expert_buf))
+    n_self   = batch_size - n_expert
+    if len(selfplay_buffer) < n_self:
+        return None
+
+    states = policies = values = concepts = None
+    if n_self:
+        samples = random.sample(selfplay_buffer.buf, n_self)
+        s, p, v, c = zip(*samples)
+        states = np.asarray(s)
+        policies = np.asarray(p)
+        values = np.asarray(v, dtype=np.float32)
+        concepts = np.asarray(c)
+
+    if n_expert:
+        expert_states, expert_policies, expert_values, expert_concepts = (
+            expert_buf.sample(n_expert)
+        )
+        if states is None:
+            states = expert_states
+            policies = expert_policies
+            values = expert_values
+            concepts = expert_concepts
+        else:
+            states = np.concatenate((states, expert_states))
+            policies = np.concatenate((policies, expert_policies))
+            values = np.concatenate((values, expert_values))
+            concepts = np.concatenate((concepts, expert_concepts))
+
+    order = np.random.permutation(batch_size)
+    return _tensorize(
+        states[order],
+        policies[order],
+        values[order],
+        concepts[order],
+    )
+
+
+def _migrate_legacy_expert_actions(actions: np.ndarray) -> np.ndarray:
+    """Convert the old 4096+from*64+to knight-promotion encoding."""
+    from chess_env import move_to_idx
+
+    migrated = actions.astype(np.int32, copy=True)
+    for row in np.flatnonzero(migrated >= 4096):
+        base = int(migrated[row]) - 4096
+        move = chess.Move(
+            base >> 6,
+            base & 63,
+            promotion=chess.KNIGHT,
+        )
+        migrated[row] = move_to_idx(move)
+    return migrated
+
+
+def _load_compact_expert_buffer(source_stat: os.stat_result) -> bool:
+    if not os.path.exists(EXPERT_COMPACT_PATH):
+        return False
+    data = np.load(EXPERT_COMPACT_PATH)
+    if (
+        int(data.get("schema_version", 0)) != EXPERT_SCHEMA_VERSION
+        or int(data.get("source_size", -1)) != source_stat.st_size
+        or int(data.get("source_mtime_ns", -1)) != source_stat.st_mtime_ns
+    ):
+        return False
+    expert_buf.load(
+        data["states"],
+        data["actions"].astype(np.int32),
+        data["values"].astype(np.float32),
+        data["concepts"].astype(np.float32),
+    )
+    return True
+
+
+def _convert_expert_buffer(source_stat: os.stat_result) -> None:
+    data = np.load(EXPERT_BUF_PATH)
+    required = {"states", "policies", "values", "concepts"}
+    missing = required.difference(data.files)
+    if missing:
+        raise ValueError("expert buffer missing arrays: " + ", ".join(sorted(missing)))
+
+    states = data["states"]
+    dense_policies = data["policies"]
+    values = data["values"].astype(np.float32)
+    concepts = data["concepts"].astype(np.float32)
+    n_samples = len(values)
+    if (
+        states.shape != (n_samples, INPUT_PLANES, 8, 8)
+        or dense_policies.shape != (n_samples, ACTION_SIZE)
+        or concepts.shape[0] != n_samples
+    ):
+        raise ValueError("expert buffer arrays have incompatible shapes")
+
+    actions = np.empty(n_samples, dtype=np.int32)
+    for start in range(0, n_samples, 2048):
+        chunk = dense_policies[start:start + 2048]
+        nonzero = np.count_nonzero(chunk, axis=1)
+        sums = chunk.astype(np.float32).sum(axis=1)
+        if np.any(nonzero != 1) or np.any(np.abs(sums - 1.0) > 1e-4):
+            raise ValueError("expert policies must be one-hot distributions")
+        actions[start:start + len(chunk)] = np.argmax(chunk, axis=1)
+
+    source_schema = int(data["schema_version"]) if "schema_version" in data else 1
+    if source_schema == 1:
+        actions = _migrate_legacy_expert_actions(actions)
+    elif source_schema != EXPERT_SCHEMA_VERSION:
+        raise ValueError(f"unsupported expert schema: {source_schema}")
+    if np.any(actions < 0) or np.any(actions >= ACTION_SIZE):
+        raise ValueError("expert buffer contains out-of-range actions")
+
+    del dense_policies
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    np.savez_compressed(
+        EXPERT_COMPACT_PATH,
+        states=states,
+        actions=actions,
+        values=values,
+        concepts=concepts,
+        schema_version=np.array(EXPERT_SCHEMA_VERSION, dtype=np.int64),
+        source_size=np.array(source_stat.st_size, dtype=np.int64),
+        source_mtime_ns=np.array(source_stat.st_mtime_ns, dtype=np.int64),
+    )
+    expert_buf.load(states, actions, values, concepts)
+
+
+def load_expert_buffer() -> int:
+    """Load Stockfish-labeled samples into the non-evictable expert buffer."""
+    if not os.path.exists(EXPERT_BUF_PATH):
+        print("[expert] No expert buffer found — training on self-play only.")
+        return 0
+    source_stat = os.stat(EXPERT_BUF_PATH)
+    if not _load_compact_expert_buffer(source_stat):
+        print("[expert] Converting legacy dense expert buffer to compact format...")
+        _convert_expert_buffer(source_stat)
+    print(f"[expert] Loaded {len(expert_buf):,} expert samples (non-evictable, "
+          f"{EXPERT_BATCH_FRAC:.0%} of each batch)")
+    return len(expert_buf)
 
 # ── Training state ────────────────────────────────────────────────────
 total_games    = 0

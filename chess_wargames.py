@@ -151,10 +151,11 @@ def az_update(net, buf, opt, sched=None) -> tuple | None:
     One gradient step. Returns (total, policy, value, concept) loss floats,
     or None if the buffer is too small to sample a batch.
     """
-    if len(buf) < BATCH_SIZE:
+    batch = M.sample_training_batch(buf, BATCH_SIZE)
+    if batch is None:
         return None
 
-    states, policies, values, concept_labels = buf.sample(BATCH_SIZE)
+    states, policies, values, concept_labels = batch
     net.train()
     policy_logits, value_pred, concepts_pred = net(states)
 
@@ -338,6 +339,8 @@ def _run_benchmark(net, dev) -> dict:
 def train():
     if not load_checkpoint():
         print("[wargames] Starting fresh — no checkpoint found.")
+
+    M.load_expert_buffer()
 
     atexit.register(save_checkpoint, sync_model=False)
 

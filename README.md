@@ -165,7 +165,8 @@ The image uses CPU-only PyTorch to keep image size manageable. Bind-mount `check
 | 17 | En passant square |
 | 18 | Repetition flag |
 
-Move indexing: `from_sq * 64 + to_sq` (0–4095). Knight underpromotions use indices 4096–8191.
+Move indexing: `from_sq * 64 + to_sq` (0–4095). Knight, bishop, and rook
+underpromotions use compact indices 4096–4239.
 
 ## Key constants
 
@@ -178,6 +179,11 @@ Move indexing: `from_sq * 64 + to_sq` (0–4095). Knight underpromotions use ind
 | `MCTS_SIMS_HUMAN` | 50 (GPU) / 20 (CPU) | `app.py` |
 | `MAX_MOVES` | 200 | `chess_wargames.py` |
 | `RESIGN_THRESHOLD` | −0.70 | `chess_wargames.py` |
+
+Training batches mix 25% Stockfish-evaluated expert positions with 75%
+self-play positions when `checkpoint/expert_buffer.npz` is present. Override
+the ratio with `EXPERT_BATCH_FRAC`; set it to `0` for pure self-play. Legacy
+expert files are validated and converted once to a compact cached format.
 
 ## API endpoints
 
